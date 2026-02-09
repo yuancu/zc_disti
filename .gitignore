@@ -1,4 +1,5 @@
 artifacts/
 data/
 docs/
+mlruns/
 __pycache__
