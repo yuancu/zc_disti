@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 
@@ -263,6 +264,7 @@ def main():
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
+        ddp_find_unused_parameters=True,
     )
 
     trainer = SentenceTransformerTrainer(
@@ -273,10 +275,13 @@ def main():
     )
 
     trainer.train()
-    model.save_pretrained(args.output_dir)
-    print(f"Saved to: {args.output_dir}")
 
-    if not args.skip_eval:
+    is_main = int(os.environ.get("RANK", "0")) == 0
+    if is_main:
+        model.save_pretrained(args.output_dir)
+        print(f"Saved to: {args.output_dir}")
+
+    if not args.skip_eval and is_main:
         try:
             import mteb
 
