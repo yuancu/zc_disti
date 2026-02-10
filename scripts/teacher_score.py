@@ -1,5 +1,7 @@
+# requires transformers < 4.46
 import argparse
 import json
+import time
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -38,7 +40,7 @@ elif args.quantize == "int4":
         bnb_4bit_quant_type="nf4",
     )
 else:
-    model_kwargs["dtype"] = torch.float16
+    model_kwargs["torch_dtype"] = torch.float16
 
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 if args.model == "gemma2":
@@ -146,7 +148,27 @@ with open(args.input, "r") as f:
             all_pairs.append([query, doc])
 
 print(f"Total pairs: {len(all_pairs)}")
+
+t0 = time.perf_counter()
 scores = compute_scores(all_pairs)
+torch.cuda.synchronize()
+elapsed = time.perf_counter() - t0
+print(f"compute_scores wall clock: {elapsed:.3f}s ({elapsed / len(all_pairs) * 1000:.2f} ms/pair)")
+
+# Write timing metadata sidecar
+meta = {
+    "model": args.model,
+    "quantize": args.quantize,
+    "batch_size": args.batch_size,
+    "max_length": args.max_length,
+    "num_pairs": len(all_pairs),
+    "elapsed_s": round(elapsed, 4),
+    "ms_per_pair": round(elapsed / len(all_pairs) * 1000, 4),
+}
+meta_path = args.output.rsplit(".", 1)[0] + ".meta.json"
+with open(meta_path, "w") as f:
+    json.dump(meta, f, indent=2)
+print(f"Metadata written to {meta_path}")
 
 # 后处理：将 scores 按 query 分组，组装成 all_samples
 all_samples = []
