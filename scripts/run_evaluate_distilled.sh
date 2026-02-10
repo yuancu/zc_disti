@@ -18,7 +18,7 @@ echo "=============================================="
 # Format: "model_subdir|dataset_name|display_name"
 declare -a EVALUATIONS=(
     "bge-m3_hc3finance|HC3Finance|hc3finance"
-    "bge-m3_cure_v1|CUREv1_en|cure_v1"
+    # "bge-m3_cure_v1|CUREv1_en|cure_v1"
 )
 
 for eval_config in "${EVALUATIONS[@]}"; do
@@ -34,7 +34,7 @@ for eval_config in "${EVALUATIONS[@]}"; do
         --data-dir "$DATA_DIR" \
         --datasets "$dataset_name" \
         --output "$OUTPUT_DIR/distilled_${display_name}.json" \
-        --batch-size 16
+        --batch-size 64
 done
 
 echo ""

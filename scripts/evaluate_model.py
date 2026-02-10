@@ -22,12 +22,14 @@ Usage:
 """
 
 import argparse
+import functools
 import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
 
+import torch
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
 
@@ -118,6 +120,7 @@ def evaluate_model(
     dataset_name: str,
     data_dir: Path,
     batch_size: int,
+    pool=None,
 ) -> EvalResult:
     """Evaluate a model on a dataset.
 
@@ -126,6 +129,7 @@ def evaluate_model(
         dataset_name: Name of the dataset
         data_dir: Directory containing the dataset
         batch_size: Batch size for encoding
+        pool: Multi-process pool from model.start_multi_process_pool() for multi-GPU encoding
 
     Returns:
         EvalResult with metrics
@@ -154,6 +158,28 @@ def evaluate_model(
         show_progress_bar=True,
         batch_size=batch_size
     )
+
+    # If a multi-GPU pool is available, patch the evaluator's embed_inputs
+    # to route encode calls through the pool for distributed encoding.
+    if pool is not None:
+        original_embed_inputs = evaluator.embed_inputs
+
+        def embed_inputs_with_pool(model, sentences, **kwargs):
+            # Only pass kwargs that model.encode() accepts
+            encode_kwargs = {}
+            for key in ("prompt_name", "prompt", "normalize_embeddings", "truncate_dim"):
+                if key in kwargs:
+                    encode_kwargs[key] = kwargs[key]
+            embs = model.encode(
+                sentences,
+                pool=pool,
+                batch_size=batch_size,
+                show_progress_bar=True,
+                **encode_kwargs,
+            )
+            return torch.tensor(embs)
+
+        evaluator.embed_inputs = embed_inputs_with_pool
 
     # Run evaluation
     results = evaluator(model)
@@ -298,21 +324,35 @@ Examples:
     # Load model
     model = load_model(args.model_path, args.max_seq_length)
 
+    # Start multi-GPU pool if multiple GPUs are available
+    num_gpus = torch.cuda.device_count()
+    pool = None
+    if num_gpus > 1:
+        print(f"Starting multi-GPU encoding pool on {num_gpus} GPUs")
+        pool = model.start_multi_process_pool(
+            target_devices=[f"cuda:{i}" for i in range(num_gpus)]
+        )
+
     # Evaluate on each dataset
     results = []
-    for dataset_name in args.datasets:
-        try:
-            result = evaluate_model(
-                model=model,
-                dataset_name=dataset_name,
-                data_dir=args.data_dir,
-                batch_size=args.batch_size,
-            )
-            results.append(result)
-        except Exception as e:
-            print(f"Error evaluating {dataset_name}: {e}")
-            import traceback
-            traceback.print_exc()
+    try:
+        for dataset_name in args.datasets:
+            try:
+                result = evaluate_model(
+                    model=model,
+                    dataset_name=dataset_name,
+                    data_dir=args.data_dir,
+                    batch_size=args.batch_size,
+                    pool=pool,
+                )
+                results.append(result)
+            except Exception as e:
+                print(f"Error evaluating {dataset_name}: {e}")
+                import traceback
+                traceback.print_exc()
+    finally:
+        if pool is not None:
+            model.stop_multi_process_pool(pool)
 
     # Print summary
     if results:

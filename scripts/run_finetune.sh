@@ -12,7 +12,7 @@ MODEL_NAME="BAAI/bge-m3"
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||')
 NUM_GPUS=4
 
-DATASETS=("hc3finance" "cure_v1")
+DATASETS=("hc3finance")
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -27,6 +27,7 @@ for dataset in "${DATASETS[@]}"; do
     --output_dir "$OUTPUT_DIR/${BASE_MODEL_NAME}_${dataset}" \
     --train_batch_size 4 \
     --gradient_accumulation_steps 1 \
+    --max_steps 200 \
     --skip_eval
   echo ""
 done

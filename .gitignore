@@ -2,4 +2,6 @@ artifacts/
 data/
 docs/
 mlruns/
+results/
+sample/
 __pycache__
