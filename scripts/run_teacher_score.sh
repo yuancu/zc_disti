@@ -5,10 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 INPUT_DIR="$PROJECT_DIR/artifacts/hard-negative"
-OUTPUT_DIR="$PROJECT_DIR/artifacts/teacher-score"
+OUTPUT_DIR="$PROJECT_DIR/artifacts/teacher-score-gemma2"
 NUM_GPUS=4
 
-DATASETS=("hc3finance" "cure_v1")
+# DATASETS=("hc3finance" "cure_v1")
+# DATASETS=("aila-casedocs" "legal-summ" "legalquad")
+DATASETS=("finqa" "financebench")
 
 mkdir -p "$OUTPUT_DIR"
 

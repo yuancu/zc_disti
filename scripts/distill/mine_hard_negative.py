@@ -98,7 +98,7 @@ def load_raw_corpus(corpus_path: str) -> tuple[dict[str, str], list[str], list[s
         for line in f:
             if line.strip():
                 doc = json.loads(line)
-                doc_id = doc["id"]
+                doc_id = doc.get("id") or doc["_id"]
                 text = doc["text"]
                 doc_id_to_text[doc_id] = text
                 doc_ids.append(doc_id)

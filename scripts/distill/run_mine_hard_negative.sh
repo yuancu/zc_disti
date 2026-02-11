@@ -2,21 +2,32 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 BEDROCK_DIR="$PROJECT_DIR/data/bedrock"
+EVAL_DIR="$PROJECT_DIR/data/eval"
 RESULT_DIR="$PROJECT_DIR/artifacts/hard-negative"
 NUM_NEGATIVES=20
 
 # Dataset name -> bedrock output file, corpus file
 declare -A BEDROCK_FILES=(
-  ["cure_v1"]="$BEDROCK_DIR/cure_v1_batch_input.jsonl.out"
-  ["hc3finance"]="$BEDROCK_DIR/hc3finance_batch_input.jsonl.out"
+  # ["cure_v1"]="$BEDROCK_DIR/cure_v1_batch_input.jsonl.out"
+  # ["hc3finance"]="$BEDROCK_DIR/hc3finance_batch_input.jsonl.out"
+  # ["aila-casedocs"]="$BEDROCK_DIR/aila-casedocs_batch_input.jsonl.out"
+  ["finqa"]="$BEDROCK_DIR/finqa_batch_input.jsonl.out"
+  ["financebench"]="$BEDROCK_DIR/financebench_batch_input.jsonl.out"
+  # ["legal-summ"]="$BEDROCK_DIR/legal-summ_batch_input.jsonl.out"
+  # ["legalquad"]="$BEDROCK_DIR/legalquad_batch_input.jsonl.out"
 )
 
 declare -A CORPUS_FILES=(
-  ["cure_v1"]="/home/ubuntu/src/ir-fine-tune-evaluation/data/CUREv1_en/corpus.jsonl"
-  ["hc3finance"]="/home/ubuntu/src/ir-fine-tune-evaluation/data/HC3Finance/corpus.jsonl"
+  # ["cure_v1"]="/home/ubuntu/src/ir-fine-tune-evaluation/data/CUREv1_en/corpus.jsonl"
+  # ["hc3finance"]="$EVAL_DIR/HC3Finance/corpus.jsonl"
+  # ["aila-casedocs"]="$EVAL_DIR/AILA_casedocs/corpus.jsonl"
+  ["finqa"]="$EVAL_DIR/finqa/corpus.jsonl"
+  ["financebench"]="$EVAL_DIR/financebench/corpus.jsonl"
+  # ["legal-summ"]="$EVAL_DIR/legal_summarization/corpus.jsonl"
+  # ["legalquad"]="$EVAL_DIR/LegalQuAD/corpus.jsonl"
 )
 
 # mine_hard_negative.py expects a specific directory layout:

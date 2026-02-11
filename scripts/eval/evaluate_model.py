@@ -275,7 +275,7 @@ Examples:
     )
 
     # Get project directory for relative defaults
-    project_dir = Path(__file__).parent.parent
+    project_dir = Path(__file__).parent.parent.parent
 
     parser.add_argument(
         "--model-path",

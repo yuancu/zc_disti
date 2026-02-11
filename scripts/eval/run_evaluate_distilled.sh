@@ -33,7 +33,7 @@ for eval_config in "${EVALUATIONS[@]}"; do
         --model-path "$MODEL_DIR/$model_subdir" \
         --data-dir "$DATA_DIR" \
         --datasets "$dataset_name" \
-        --output "$OUTPUT_DIR/distilled_${display_name}.json" \
+        --output "$OUTPUT_DIR/distilled_${display_name}_gemma2_500steps.json" \
         --batch-size 64
 done
 
