@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 INPUT_DIR="$PROJECT_DIR/artifacts/teacher-score-gemma2"
 OUTPUT_DIR="$PROJECT_DIR/artifacts/distilled"
@@ -12,7 +12,8 @@ MODEL_NAME="BAAI/bge-m3"
 BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||')
 NUM_GPUS=4
 
-DATASETS=("hc3finance" "cure_v1")
+# DATASETS=("hc3finance" "cure_v1")
+DATASETS=("aila-casedocs" "legal-summ" "legalquad" "finqa" "financebench")
 
 mkdir -p "$OUTPUT_DIR"
 
