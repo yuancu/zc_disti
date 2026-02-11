@@ -49,7 +49,8 @@ def main():
 
     # Paths
     parser.add_argument("--data-dir", type=Path, default=project_dir / "synthetic_data" / "training-data-20k")
-    parser.add_argument("--output-dir", type=Path, default=project_dir / "output")
+    parser.add_argument("--output-dir", type=Path, default=project_dir / "artifacts" / "models" / "finetuned")
+    parser.add_argument("--log-dir", type=Path, default=project_dir / "output")
     parser.add_argument("--model-name", type=str, default=DEFAULT_MODEL)
 
     # Training
@@ -66,12 +67,15 @@ def main():
 
     # Setup paths
     data_path = args.data_dir / f"{args.dataset}.jsonl"
-    output_path = args.output_dir / args.dataset / timestamp
+    model_output_path = args.output_dir / args.dataset
+    log_path = args.log_dir / args.dataset / timestamp
     if state.is_main_process:
-        output_path.mkdir(parents=True, exist_ok=True)
+        model_output_path.mkdir(parents=True, exist_ok=True)
+        log_path.mkdir(parents=True, exist_ok=True)
         print(f"Dataset: {args.dataset}")
         print(f"Training data: {data_path}")
-        print(f"Output: {output_path}")
+        print(f"Model output: {model_output_path}")
+        print(f"Logs: {log_path}")
 
     # Load data
     if not data_path.exists():
@@ -88,15 +92,14 @@ def main():
     model.max_seq_length = args.max_seq_length
 
     # Train
-    os.environ["TENSORBOARD_LOGGING_DIR"] = str(output_path / "tensorboard")
-
     total_steps = (len(train_dataset) // args.batch_size) * args.epochs
     warmup_steps = int(total_steps * 0.1)
 
     trainer = SentenceTransformerTrainer(
         model=model,
         args=SentenceTransformerTrainingArguments(
-            output_dir=str(output_path),
+            output_dir=str(log_path),
+            logging_dir=str(log_path / "tensorboard"),
             num_train_epochs=args.epochs,
             per_device_train_batch_size=args.batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -121,15 +124,14 @@ def main():
 
     # Save only on main process
     if state.is_main_process:
-        model_path = output_path / "model"
-        model.save_pretrained(str(model_path))
-        print(f"Model saved: {model_path}")
+        model.save_pretrained(str(model_output_path))
+        print(f"Model saved: {model_output_path}")
 
-        with open(output_path / "result.json", "w") as f:
+        with open(model_output_path / "result.json", "w") as f:
             json.dump({
                 "dataset": args.dataset,
                 "training_samples": len(train_dataset),
-                "model_path": str(model_path),
+                "model_path": str(model_output_path),
                 "config": {
                     "epochs": args.epochs,
                     "batch_size": args.batch_size,

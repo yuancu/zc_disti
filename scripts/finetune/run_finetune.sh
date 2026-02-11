@@ -1,22 +1,25 @@
 #!/bin/bash
 set -e
 
-SCRIPT_DIR="scripts"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-DATA_DIR = "${PROJECT_DIR}/data/finetune"
+SCRIPT_DIR="scripts/finetune"
+PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
+DATA_DIR="${PROJECT_DIR}/data/finetune"
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export NUM_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 # space separated dataset names [data-dir/dataset-name]
-DATASETS="sample"
+DATASETS="financebench finqa"
 
 for dataset in $DATASETS; do
     echo "===== Training: $dataset ====="
-    accelerate launch --multi_gpu --num_processes=4 ${SCRIPT_DIR}/finetune.py \
-        --data-dir DATA_DIR \
+    accelerate launch --num_processes=$NUM_DEVICES ${SCRIPT_DIR}/finetune.py \
+        --data-dir ${DATA_DIR} \
         --dataset $dataset \
-        --output-dir ${PROJECT_DIR}/output \
-        --max-seq-length 1024
+        --output-dir ${PROJECT_DIR}/artifacts/models/finetuned \
+        --log-dir ${PROJECT_DIR}/output \
+        --max-seq-length 1024 \
+        --batch-size 8
 done
 
 echo "All done!"
