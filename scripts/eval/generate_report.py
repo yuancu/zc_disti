@@ -7,7 +7,7 @@ from pathlib import Path
 from datetime import datetime
 
 
-def load_results(results_dir: Path) -> dict:
+def load_results(results_dir: Path, prefix: str = "finetuned") -> dict:
     """Load all result files from the results directory."""
     results = {
         "baseline": {},
@@ -21,8 +21,8 @@ def load_results(results_dir: Path) -> dict:
             data = json.load(f)
             results["baseline"] = data.get("datasets", {})
 
-    # Load fine-tuned results
-    for path in results_dir.glob("finetuned_*.json"):
+    # Load model results matching the given prefix
+    for path in results_dir.glob(f"{prefix}_*.json"):
         with open(path) as f:
             data = json.load(f)
             for dataset, metrics in data.get("datasets", {}).items():
@@ -217,6 +217,12 @@ def main():
         default=None,
         help="Output markdown file path (default: results_dir/report.md)"
     )
+    parser.add_argument(
+        "--prefix",
+        type=str,
+        default="finetuned",
+        help="Prefix for result JSON files to load (default: finetuned)"
+    )
 
     args = parser.parse_args()
 
@@ -227,7 +233,7 @@ def main():
     output_path = args.output or (args.results_dir / "report.md")
 
     # Load results
-    results = load_results(args.results_dir)
+    results = load_results(args.results_dir, prefix=args.prefix)
 
     if not results["finetuned"]:
         print("Error: No fine-tuned results found")
