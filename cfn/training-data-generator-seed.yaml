@@ -1,0 +1,726 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Training Data Generator (with sample queries) - Generate synthetic query-document
+  training pairs using Bedrock batch inference from S3 document corpora.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Job Configuration"
+        Parameters:
+          - JobName
+      - Label:
+          default: "Data Source Configuration"
+        Parameters:
+          - S3DocumentUri
+          - SampleQueryUri
+          - MaxDocuments
+      - Label:
+          default: "Bedrock Configuration"
+        Parameters:
+          - BedrockModelId
+          - QueriesPerDocument
+    ParameterLabels:
+      JobName:
+        default: "Job Name"
+      S3DocumentUri:
+        default: "S3 Document URI"
+      SampleQueryUri:
+        default: "Sample Query URI (Optional)"
+      MaxDocuments:
+        default: "Max Documents"
+      BedrockModelId:
+        default: "Bedrock Model ID"
+      QueriesPerDocument:
+        default: "Queries Per Document"
+
+Parameters:
+  JobName:
+    Type: String
+    Description: "Unique name for this training data generation job (alphanumeric, hyphens only, max 40 chars)"
+    AllowedPattern: "^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,39}"
+    ConstraintDescription: "Max 40 chars, alphanumeric and hyphens only"
+
+  S3DocumentUri:
+    Type: String
+    Description: >
+      S3 URI to a JSONL file containing documents.
+      Each line should have 'id' and 'text' fields.
+      Example: s3://bucket/docs.jsonl
+    AllowedPattern: "^s3://.*"
+    ConstraintDescription: "Must be an S3 URI starting with s3://"
+
+  SampleQueryUri:
+    Type: String
+    Description: >
+      (Optional) S3 URI to a JSONL file with sample queries.
+      First 3 queries will be used as examples in the prompt.
+      Each line should have 'text' or 'query' field.
+    Default: ""
+
+  MaxDocuments:
+    Type: Number
+    Description: "Maximum documents to process"
+    Default: 20000
+    MinValue: 100
+    MaxValue: 100000
+
+  BedrockModelId:
+    Type: String
+    Description: "Bedrock model ID for synthetic query generation"
+    Default: "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+  QueriesPerDocument:
+    Type: Number
+    Description: "Number of synthetic queries to generate per document"
+    Default: 5
+    MinValue: 1
+    MaxValue: 10
+
+Resources:
+  # =============================================================================
+  # S3 Bucket
+  # =============================================================================
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "training-data-gen-${JobName}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Purpose
+          Value: "Training Data Generation"
+
+  # =============================================================================
+  # IAM Roles
+  # =============================================================================
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${JobName}-LambdaExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub "${DataBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: "*"
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:CreateModelInvocationJob
+                  - bedrock:GetModelInvocationJob
+                  - bedrock:ListModelInvocationJobs
+                  - bedrock:StopModelInvocationJob
+                Resource: "*"
+        - PolicyName: IAMPassRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt BedrockBatchRole.Arn
+
+  # Bedrock Batch Job Role
+  BedrockBatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${JobName}-BedrockBatchRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub "${DataBucket.Arn}/*"
+        - PolicyName: BedrockInvokeModel
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: "*"
+
+  # Step Functions Execution Role
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${JobName}-StepFunctionsRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TrainingDataGeneratorLambda.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  # Trigger Lambda Role
+  TriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${JobName}-TriggerLambdaRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsAndLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: "*"
+
+  # =============================================================================
+  # Lambda Functions
+  # =============================================================================
+
+  # Bedrock Orchestrator Lambda (inline code)
+  TrainingDataGeneratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${JobName}-BedrockOrchestrator"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: 1024
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from datetime import datetime
+          import uuid
+          import re
+          from urllib.parse import urlparse
+
+          QUERY_PROMPT = """You are an expert at generating search queries.
+          Given the following document, generate {n} diverse search queries that a user might use to find this document.
+          Document:
+          {text}
+          Generate exactly {n} queries in JSON format: {{"queries": ["query1", "query2", ...]}}
+          Only return the JSON, no additional text."""
+
+          QUERY_PROMPT_WITH_SAMPLES = """You are an expert at generating search queries.
+          Given the following document, generate {n} diverse search queries that a user might use to find this document.
+          Here are some example queries from this dataset for reference. Generate queries similar in style to these examples:
+          {samples}
+          Document:
+          {text}
+          Generate exactly {n} queries in JSON format: {{"queries": ["query1", "query2", ...]}}
+          Make sure your queries are diverse (different lengths, aspects, intents).
+          Only return the JSON, no additional text."""
+
+          def parse_s3(path):
+              p = urlparse(path)
+              return p.netloc, p.path.lstrip('/')
+
+          def read_jsonl(bucket, key):
+              s3 = boto3.client('s3')
+              content = s3.get_object(Bucket=bucket, Key=key)['Body'].read().decode('utf-8')
+              return [json.loads(line) for line in content.strip().split('\n') if line.strip()]
+
+          def write_s3(bucket, key, content):
+              boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=content.encode('utf-8'), ContentType='application/jsonl')
+              return f"s3://{bucket}/{key}"
+
+          def load_sample_queries(s3_uri, num=10):
+              if not s3_uri: return []
+              try:
+                  b, k = parse_s3(s3_uri)
+                  data = read_jsonl(b, k)[:num]
+                  queries = []
+                  for d in data:
+                      q = d.get('text') or d.get('query') or d.get('anchor') or ''
+                      if q: queries.append(q)
+                  print(f"Loaded {len(queries)} sample queries")
+                  return queries
+              except Exception as e:
+                  print(f"Error loading samples: {e}")
+                  return []
+
+          def prepare_input(event):
+              path = event['s3_documents_path']
+              bucket = os.environ['DATA_BUCKET']
+              max_docs = event.get('max_documents', 20000)
+              n_queries = int(os.environ.get('QUERIES_PER_DOCUMENT', '5'))
+              sample_uri = event.get('sample_query_uri', '')
+              samples = load_sample_queries(sample_uri)
+              b, k = parse_s3(path)
+              docs = read_jsonl(b, k)[:max_docs]
+              records = []
+              for doc in docs:
+                  did = doc.get('id', str(uuid.uuid4()))
+                  text = doc.get('text', '')[:8000]
+                  if samples:
+                      prompt = QUERY_PROMPT_WITH_SAMPLES.format(n=n_queries, text=text, samples='\n'.join(f'- {q}' for q in samples))
+                  else:
+                      prompt = QUERY_PROMPT.format(n=n_queries, text=text)
+                  records.append({"recordId": did, "modelInput": {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]}})
+              ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+              out_key = f"bedrock-batch/input/batch_{ts}.jsonl"
+              out_path = write_s3(bucket, out_key, '\n'.join(json.dumps(r) for r in records))
+              return {"s3_input_path": out_path, "record_count": len(records)}
+
+          def create_job(event):
+              bucket = os.environ['DATA_BUCKET']
+              model = os.environ.get('BEDROCK_MODEL_ID', 'us.anthropic.claude-haiku-4-5-20251001-v1:0')
+              role = os.environ['BEDROCK_BATCH_ROLE_ARN']
+              ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+              resp = boto3.client('bedrock').create_model_invocation_job(
+                  jobName=f"qgen-{ts}", modelId=model, roleArn=role,
+                  inputDataConfig={"s3InputDataConfig": {"s3Uri": event['s3_input_path']}},
+                  outputDataConfig={"s3OutputDataConfig": {"s3Uri": f"s3://{bucket}/bedrock-batch/output/{ts}/"}})
+              return {"job_arn": resp['jobArn'], "job_id": f"qgen-{ts}"}
+
+          def check_status(event):
+              resp = boto3.client('bedrock').get_model_invocation_job(jobIdentifier=event['job_arn'])
+              output_path = resp.get('outputDataConfig', {}).get('s3OutputDataConfig', {}).get('s3Uri', '')
+              return {"status": resp['status'], "message": resp.get('message', ''), "output_s3_path": output_path}
+
+          def normalize_quotes(s):
+              return s.replace('\u201c', '"').replace('\u201d', '"').replace('\u2018', "'").replace('\u2019', "'").replace('\u300c', '"').replace('\u300d', '"')
+
+          def extract_queries_fallback(text):
+              queries = []
+              for m in re.finditer(r'"queries"\s*:\s*\[(.*?)\]', text, re.DOTALL):
+                  arr = m.group(1)
+                  for qm in re.finditer(r'^\s*"(.+?)"\s*,?\s*$', arr, re.MULTILINE):
+                      q = qm.group(1).replace('\\"', '"')
+                      if q.strip(): queries.append(q.strip())
+              return queries
+
+          def process_output(event):
+              bucket = os.environ['DATA_BUCKET']
+              s3 = boto3.client('s3')
+              db, dk = parse_s3(event['s3_documents_path'])
+              docs = {d['id']: d['text'] for d in read_jsonl(db, dk)}
+              ob, op = parse_s3(event['output_s3_path'])
+              files = [o['Key'] for o in s3.list_objects_v2(Bucket=ob, Prefix=op).get('Contents', []) if o['Key'].endswith('.jsonl.out')]
+              pairs, errors = [], 0
+              for f in files:
+                  content = s3.get_object(Bucket=ob, Key=f)['Body'].read().decode('utf-8')
+                  for line in content.strip().split('\n'):
+                      if not line.strip(): continue
+                      rec = json.loads(line)
+                      rid = rec.get('recordId')
+                      out = rec.get('modelOutput', {})
+                      text = next((b['text'] for b in out.get('content', []) if b.get('type') == 'text'), '')
+                      if not text: continue
+                      queries = []
+                      try:
+                          t = normalize_quotes(text.strip())
+                          if t.startswith('```'): t = '\n'.join(t.split('\n')[1:-1])
+                          queries = json.loads(t).get('queries', [])
+                      except:
+                          try:
+                              m = re.search(r'\{.*\}', normalize_quotes(text), re.DOTALL)
+                              queries = json.loads(m.group()).get('queries', []) if m else []
+                          except:
+                              queries = extract_queries_fallback(text)
+                              if not queries: errors += 1
+                      doc_text = docs.get(rid)
+                      if doc_text:
+                          for q in queries:
+                              if isinstance(q, str) and q.strip():
+                                  pairs.append({"anchor": q.strip(), "positive": doc_text})
+              ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+              out_path = write_s3(bucket, f"training-data/training_{ts}.jsonl", '\n'.join(json.dumps(p, ensure_ascii=False) for p in pairs))
+              print(f"Processed {len(pairs)} pairs, {errors} parse errors skipped")
+              return {"training_data_s3_path": f"s3://{bucket}/training-data/", "training_pairs_count": len(pairs), "parse_errors": errors}
+
+          def handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+              op = event.get('operation')
+              if op == 'prepare_input': return prepare_input(event)
+              elif op == 'create_job': return create_job(event)
+              elif op == 'check_status': return check_status(event)
+              elif op == 'process_output': return process_output(event)
+              else: raise ValueError(f"Unknown operation: {op}")
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucket
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          QUERIES_PER_DOCUMENT: !Ref QueriesPerDocument
+          BEDROCK_BATCH_ROLE_ARN: !GetAtt BedrockBatchRole.Arn
+
+  # =============================================================================
+  # CloudWatch Log Group for State Machine
+  # =============================================================================
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/stepfunctions/${JobName}-TrainingDataGenStateMachine"
+      RetentionInDays: 14
+
+  # =============================================================================
+  # Step Functions State Machine
+  # =============================================================================
+  TrainingDataGenStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn:
+      - TrainingDataGeneratorLambda
+    Properties:
+      StateMachineName: !Sub "${JobName}-TrainingDataGenStateMachine"
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+        Level: ALL
+        IncludeExecutionData: true
+      TracingConfiguration:
+        Enabled: true
+      DefinitionString:
+        Fn::Sub:
+          - |
+            {
+              "Comment": "Training Data Generation Pipeline - Generate queries via Bedrock batch, save training pairs",
+              "StartAt": "PrepareBedrockInput",
+              "States": {
+                "PrepareBedrockInput": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${TrainingDataGeneratorLambdaArn}",
+                    "Payload": {
+                      "operation": "prepare_input",
+                      "s3_documents_path.$": "$.s3_document_uri",
+                      "max_documents.$": "$.max_documents",
+                      "sample_query_uri.$": "$.sample_query_uri"
+                    }
+                  },
+                  "ResultSelector": {
+                    "s3_input_path.$": "$.Payload.s3_input_path",
+                    "record_count.$": "$.Payload.record_count"
+                  },
+                  "ResultPath": "$.bedrock_input_result",
+                  "Retry": [
+                    {
+                      "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+                      "IntervalSeconds": 2,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2
+                    }
+                  ],
+                  "Next": "CreateBedrockBatchJob"
+                },
+                "CreateBedrockBatchJob": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${TrainingDataGeneratorLambdaArn}",
+                    "Payload": {
+                      "operation": "create_job",
+                      "s3_input_path.$": "$.bedrock_input_result.s3_input_path"
+                    }
+                  },
+                  "ResultSelector": {
+                    "job_arn.$": "$.Payload.job_arn",
+                    "job_id.$": "$.Payload.job_id"
+                  },
+                  "ResultPath": "$.bedrock_job_result",
+                  "Retry": [
+                    {
+                      "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+                      "IntervalSeconds": 2,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2
+                    }
+                  ],
+                  "Next": "WaitForBedrockJob"
+                },
+                "WaitForBedrockJob": {
+                  "Type": "Wait",
+                  "Seconds": 60,
+                  "Next": "CheckBedrockJobStatus"
+                },
+                "CheckBedrockJobStatus": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${TrainingDataGeneratorLambdaArn}",
+                    "Payload": {
+                      "operation": "check_status",
+                      "job_arn.$": "$.bedrock_job_result.job_arn"
+                    }
+                  },
+                  "ResultSelector": {
+                    "status.$": "$.Payload.status",
+                    "output_s3_path.$": "$.Payload.output_s3_path",
+                    "message.$": "$.Payload.message"
+                  },
+                  "ResultPath": "$.bedrock_status_result",
+                  "Retry": [
+                    {
+                      "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+                      "IntervalSeconds": 2,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2
+                    }
+                  ],
+                  "Next": "BedrockStatusChoice"
+                },
+                "BedrockStatusChoice": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.bedrock_status_result.status",
+                      "StringEquals": "Completed",
+                      "Next": "ProcessBedrockOutput"
+                    },
+                    {
+                      "Variable": "$.bedrock_status_result.status",
+                      "StringEquals": "Failed",
+                      "Next": "FailBedrockJob"
+                    },
+                    {
+                      "Variable": "$.bedrock_status_result.status",
+                      "StringEquals": "Stopped",
+                      "Next": "FailBedrockJob"
+                    }
+                  ],
+                  "Default": "WaitForBedrockJob"
+                },
+                "FailBedrockJob": {
+                  "Type": "Fail",
+                  "Cause": "Bedrock batch job failed or was stopped",
+                  "Error": "BedrockJobFailed"
+                },
+                "ProcessBedrockOutput": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${TrainingDataGeneratorLambdaArn}",
+                    "Payload": {
+                      "operation": "process_output",
+                      "output_s3_path.$": "$.bedrock_status_result.output_s3_path",
+                      "s3_documents_path.$": "$.s3_document_uri"
+                    }
+                  },
+                  "ResultSelector": {
+                    "training_data_s3_path.$": "$.Payload.training_data_s3_path",
+                    "training_pairs_count.$": "$.Payload.training_pairs_count"
+                  },
+                  "ResultPath": "$.training_data_result",
+                  "Retry": [
+                    {
+                      "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+                      "IntervalSeconds": 2,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2
+                    }
+                  ],
+                  "Next": "Success"
+                },
+                "Success": {
+                  "Type": "Succeed",
+                  "Comment": "Training data generation completed successfully"
+                }
+              }
+            }
+          - TrainingDataGeneratorLambdaArn: !GetAtt TrainingDataGeneratorLambda.Arn
+
+  # =============================================================================
+  # Auto-Trigger Workflow
+  # =============================================================================
+  TriggerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${JobName}-TriggerWorkflow"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt TriggerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+
+          def lambda_handler(event, context):
+              print(f"Event: {event}")
+              request_type = event['RequestType']
+
+              if request_type == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              if request_type == 'Update':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  props = event['ResourceProperties']
+                  sfn = boto3.client('stepfunctions')
+
+                  input_payload = json.loads(props['ExecutionInput'])
+
+                  response = sfn.start_execution(
+                      stateMachineArn=props['StateMachineArn'],
+                      input=json.dumps(input_payload)
+                  )
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'ExecutionArn': response['executionArn']
+                  })
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # Custom Resource to Auto-Trigger Workflow on Deployment
+  AutoTriggerWorkflow:
+    Type: Custom::TriggerWorkflow
+    DependsOn:
+      - TrainingDataGenStateMachine
+    Properties:
+      ServiceToken: !GetAtt TriggerLambdaFunction.Arn
+      StateMachineArn: !Ref TrainingDataGenStateMachine
+      ExecutionInput: !Sub |
+        {
+          "s3_document_uri": "${S3DocumentUri}",
+          "max_documents": ${MaxDocuments},
+          "sample_query_uri": "${SampleQueryUri}"
+        }
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  DataBucketName:
+    Description: "S3 bucket for data and training output"
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-DataBucket"
+
+  StateMachineArn:
+    Description: "Step Functions State Machine ARN"
+    Value: !Ref TrainingDataGenStateMachine
+    Export:
+      Name: !Sub "${AWS::StackName}-StateMachineArn"
+
+  TrainingDataGeneratorLambdaArn:
+    Description: "Training Data Generator Lambda ARN"
+    Value: !GetAtt TrainingDataGeneratorLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TrainingDataGeneratorLambda"
+
+  BedrockBatchRoleArn:
+    Description: "Bedrock Batch Job Role ARN"
+    Value: !GetAtt BedrockBatchRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BedrockBatchRole"
+
+  TrainingDataOutputPath:
+    Description: "S3 path where training data will be stored"
+    Value: !Sub "s3://${DataBucket}/training-data/"
+    Export:
+      Name: !Sub "${AWS::StackName}-TrainingDataPath"
+
+  StateMachineInputExample:
+    Description: "Example input JSON for starting the State Machine manually"
+    Value: !Sub |
+      {
+        "s3_document_uri": "s3://your-bucket/documents.jsonl",
+        "max_documents": ${MaxDocuments},
+        "sample_query_uri": "s3://your-bucket/sample-queries.jsonl"
+      }
+
+  ExecutionArn:
+    Description: "Step Functions execution ARN (auto-started on deployment)"
+    Value: !GetAtt AutoTriggerWorkflow.ExecutionArn
+    Export:
+      Name: !Sub "${AWS::StackName}-ExecutionArn"
