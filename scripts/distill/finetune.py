@@ -224,6 +224,17 @@ def parse_args():
     return parser.parse_args()
 
 
+def cap_max_steps(max_steps: int, dataset_size: int, batch_size: int, gradient_accumulation_steps: int) -> int:
+    """Return effective max_steps capped at 1 epoch, or -1 if max_steps is not set."""
+    if max_steps <= 0:
+        return max_steps
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    steps_per_epoch = max(dataset_size // (batch_size * world_size * gradient_accumulation_steps), 1)
+    effective = min(max_steps, steps_per_epoch)
+    print(f"1 epoch = {steps_per_epoch} steps, max_steps = {max_steps} → effective_max_steps = {effective}")
+    return effective
+
+
 def main():
     args = parse_args()
 
@@ -252,10 +263,12 @@ def main():
         temperature=args.temperature,  # 温度越大分布越"软"
     )
 
+    effective_max_steps = cap_max_steps(args.max_steps, len(train_dataset), args.train_batch_size, args.gradient_accumulation_steps)
+
     training_args = SentenceTransformerTrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
-        max_steps=args.max_steps,
+        max_steps=effective_max_steps,
         per_device_train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
@@ -264,6 +277,7 @@ def main():
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
+        dataloader_drop_last=True,
         ddp_find_unused_parameters=True,
     )
 
