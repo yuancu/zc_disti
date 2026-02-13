@@ -4,15 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-INPUT_DIR="$PROJECT_DIR/artifacts/hard-negative-seeded"
-OUTPUT_DIR="$PROJECT_DIR/artifacts/teacher-score-gemma2-seeded"
+MODEL="bge-m3"
+INPUT_DIR="$PROJECT_DIR/artifacts/hard-negative"
+OUTPUT_DIR="$PROJECT_DIR/artifacts/student-score-${MODEL}"
 NUM_GPUS=4
 
-# DATASETS=("hc3finance" "cure_v1")
-# DATASETS=("aila-casedocs" "legal-summ" "legalquad")
-# DATASETS=("finqa" "financebench")
-# DATASETS=("multi-cpr-video")
-DATASETS=("legal-summ")
+DATASETS=("hc3finance" "cure_v1" "aila-casedocs" "legal-summ" "legalquad" "finqa" "financebench" "multi-cpr-video")
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -41,10 +38,10 @@ for dataset in "${DATASETS[@]}"; do
       continue
     fi
     echo "  GPU $gpu_id: $(wc -l < "$CHUNK") lines"
-    CUDA_VISIBLE_DEVICES="$gpu_id" python "$SCRIPT_DIR/teacher_score.py" \
-      --model gemma2 \
+    CUDA_VISIBLE_DEVICES="$gpu_id" python "$SCRIPT_DIR/student_score.py" \
+      --model "$MODEL" \
       --max_length 512 \
-      --batch_size 32 \
+      --batch_size 128 \
       --input "$CHUNK" \
       --output "$WORK_DIR/out_${gpu_id}.json" \
       > "$WORK_DIR/log_${gpu_id}.txt" 2>&1 &

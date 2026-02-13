@@ -4,8 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-INPUT_DIR="$PROJECT_DIR/artifacts/teacher-score-gemma2"
-OUTPUT_DIR="$PROJECT_DIR/artifacts/distilled"
+INPUT_DIR="$PROJECT_DIR/artifacts/teacher-score-gemma2-seeded"
+OUTPUT_DIR="$PROJECT_DIR/artifacts/models/distilled-200steps-scale0.05-seeded"
 
 MODEL_NAME="BAAI/bge-m3"
 # Derive a short name from the model for the output directory
@@ -13,7 +13,10 @@ BASE_MODEL_NAME=$(echo "$MODEL_NAME" | sed 's|.*/||')
 NUM_GPUS=4
 
 # DATASETS=("hc3finance" "cure_v1")
-DATASETS=("aila-casedocs" "legal-summ" "legalquad" "finqa" "financebench")
+# DATASETS=("aila-casedocs" "legal-summ" "legalquad" "finqa" "financebench")
+# DATASETS=("multi-cpr-video")
+DATASETS=("legal-summ")
+
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -28,7 +31,8 @@ for dataset in "${DATASETS[@]}"; do
     --output_dir "$OUTPUT_DIR/${BASE_MODEL_NAME}_${dataset}" \
     --train_batch_size 4 \
     --gradient_accumulation_steps 1 \
-    --max_steps 500 \
+    --max_steps 200 \
+    --teacher_score_scale_factor 0.05 \
     --skip_eval
   echo ""
 done

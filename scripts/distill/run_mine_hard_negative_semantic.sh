@@ -4,10 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-BEDROCK_DIR="$PROJECT_DIR/data/bedrock-seeded"
+BEDROCK_DIR="$PROJECT_DIR/data/bedrock"
 EVAL_DIR="$PROJECT_DIR/data/eval"
-RESULT_DIR="$PROJECT_DIR/artifacts/hard-negative-seeded"
+RESULT_DIR="$PROJECT_DIR/artifacts/hard-negative-semantic"
 NUM_NEGATIVES=20
+MODEL_NAME="BAAI/bge-m3"
+BATCH_SIZE=64
 
 # Dataset name -> bedrock output file, corpus file
 declare -A BEDROCK_FILES=(
@@ -32,7 +34,7 @@ declare -A CORPUS_FILES=(
   # ["legalquad"]="$EVAL_DIR/LegalQuAD/corpus.jsonl"
 )
 
-# mine_hard_negative.py expects a specific directory layout:
+# mine_hard_negative_semantic.py expects the same directory layout as the BM25 version:
 #   output-dir/<dataset>/<subdir>/*_batch_input.jsonl.out
 #   corpus-dir/<dataset>.jsonl
 # Create a temp workspace with symlinks to satisfy this.
@@ -56,12 +58,14 @@ for dataset in "${!BEDROCK_FILES[@]}"; do
   echo "========================================"
   echo "Processing: $dataset"
   echo "========================================"
-  python "$SCRIPT_DIR/mine_hard_negative.py" \
+  python "$SCRIPT_DIR/mine_hard_negative_semantic.py" \
     --output-dir "$OUTPUT_STAGING" \
     --corpus-dir "$CORPUS_STAGING" \
     --result-dir "$RESULT_DIR" \
+    --model-name "$MODEL_NAME" \
     --datasets "$dataset" \
-    --num-negatives "$NUM_NEGATIVES"
+    --num-negatives "$NUM_NEGATIVES" \
+    --batch-size "$BATCH_SIZE"
   echo ""
 done
 
