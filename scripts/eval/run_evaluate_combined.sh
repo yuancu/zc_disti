@@ -25,7 +25,7 @@ MODEL_DIR="$PROJECT_DIR/artifacts/models/distilled"
 # Configuration with environment variable overrides
 BASELINE_MODEL="${BASELINE_MODEL:-BAAI/bge-m3}"
 NORMALIZATION="${NORMALIZATION:-min_max}"
-ALPHA="${ALPHA:-0.5}"
+ALPHA="${ALPHA:-0.2}"
 RETRIEVAL_DEPTH="${RETRIEVAL_DEPTH:-1000}"
 
 COMBINATIONS=(arithmetic geometric harmonic)
@@ -71,7 +71,8 @@ for COMBINATION in "${COMBINATIONS[@]}"; do
     echo ""
     echo "  Evaluating BASELINE model ($BASELINE_MODEL)"
 
-    OUTPUT_FILE="$OUTPUT_DIR/combined_baseline_${NORMALIZATION}_${COMBINATION}_alpha${ALPHA}.json"
+    OUTPUT_FILE="$OUTPUT_DIR/alpha${ALPHA}/combined_baseline_${NORMALIZATION}_${COMBINATION}.json"
+    mkdir -p "$(dirname "$OUTPUT_FILE")"
 
     python "$SCRIPT_DIR/evaluate_combined.py" \
         --model-path "$BASELINE_MODEL" \
@@ -95,7 +96,7 @@ for COMBINATION in "${COMBINATIONS[@]}"; do
         echo ""
         echo "  Evaluating FINETUNED model: $dataset_name  Model: $MODEL_PATH"
 
-        OUTPUT_FILE="$OUTPUT_DIR/combined_${dataset_name}_${NORMALIZATION}_${COMBINATION}_alpha${ALPHA}.json"
+        OUTPUT_FILE="$OUTPUT_DIR/alpha${ALPHA}/combined_${dataset_name}_${NORMALIZATION}_${COMBINATION}.json"
 
         python "$SCRIPT_DIR/evaluate_combined.py" \
             --model-path "$MODEL_PATH" \

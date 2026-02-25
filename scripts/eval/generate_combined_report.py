@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""Generate evaluation report comparing base, base+BM25, and distilled+BM25 results.
+"""Generate evaluation report comparing retrieval methods against a base model.
 
-Produces a single markdown report with two key comparisons:
-1. Base vs Base+BM25 - does combining with BM25 help?
-2. Base+BM25 vs Distilled+BM25 - does distillation help in the combined setting?
+All columns (except Base) show percentage change relative to the base model's
+standalone dense retrieval: (new - base) / base * 100.
+
+Columns are included dynamically based on which inputs are provided:
+- Base: absolute score (always shown, reference point)
+- BM25: standalone BM25 (if --bm25-results provided)
+- Base+BM25 (Arith/Geome/Harmo): base model combined with BM25
+- Distilled: tuned model standalone (if --tuned-results provided)
+- Dist+BM25 (Arith/Geome/Harmo): tuned model combined with BM25
 
 Expected input:
 - --baseline-results: Path to baseline_results.json (standalone BAAI/bge-m3, no BM25)
-- --combined-dir: Directory with combined evaluation results, containing:
-    - combined_baseline_*.json (base model + BM25)
-    - combined_{dataset}_*.json (distilled model + BM25)
+- --bm25-results: (optional) Path to BM25-only results JSON
+- --tuned-results: (optional) Path to tuned/distilled model standalone results JSON
+- --combined-dir: Directory with combined evaluation results
 
 Usage:
     python generate_combined_report.py \\
         --baseline-results results/tuned/baseline_results.json \\
+        --bm25-results results/bm25_baseline/bm25_results.json \\
+        --tuned-results results/distilled_gemma2_500steps/tuned_results.json \\
         --combined-dir results/combined-distilled
 """
 
@@ -55,9 +63,10 @@ def load_combined_results(combined_dir: Path) -> dict:
         "meta": {},
     }
 
-    # Pattern: combined_{identifier}_{norm}_{combo}_alpha{alpha}.json
+    # New layout: combined_dir/combined_{identifier}_{norm}_{combo}.json
+    # (alpha is encoded in the parent directory, e.g. alpha0.5/)
     pattern = re.compile(
-        r"^combined_(.+?)_(min_max|l2)_(arithmetic|geometric|harmonic)_alpha([\d.]+)\.json$"
+        r"^combined_(.+?)_(min_max|l2)_(arithmetic|geometric|harmonic)\.json$"
     )
 
     for path in sorted(combined_dir.glob("combined_*.json")):
@@ -65,18 +74,18 @@ def load_combined_results(combined_dir: Path) -> dict:
         if not m:
             continue
 
-        identifier, norm, combo, alpha = m.groups()
+        identifier, norm, combo = m.groups()
 
         with open(path) as f:
             data = json.load(f)
 
         datasets = data.get("datasets", {})
 
-        # Store metadata per combination method
+        # Store metadata per combination method (alpha read from JSON)
         if combo not in results["meta"]:
             results["meta"][combo] = {
                 "normalization": norm,
-                "alpha": float(alpha),
+                "alpha": data.get("alpha", 0.0),
             }
 
         if identifier == "baseline":
@@ -109,22 +118,38 @@ def fmt(val, width=7):
     return f"{val:.4f}"
 
 
-def fmt_delta(val, width=7):
-    """Format a delta value with sign, or '-' if None."""
-    if val is None:
-        return "-".center(width)
-    return f"{val:+.4f}"
+def pct_delta(new_val, base_val):
+    """Compute percentage delta: (new - base) / base * 100. Returns None if not computable."""
+    if new_val is None or base_val is None or base_val == 0:
+        return None
+    return (new_val - base_val) / base_val * 100
 
 
-def generate_report(baseline, combined, output_path):
-    """Generate the markdown comparison report."""
+def fmt_pct(pct):
+    """Format a percentage value with sign, or '-' if None."""
+    if pct is None:
+        return "-"
+    return f"{pct:+.1f}%"
+
+
+def generate_report(baseline, bm25_results, tuned_results, combined, output_path):
+    """Generate the markdown comparison report.
+
+    All columns except Base show percentage delta relative to Base standalone.
+    """
     combo_methods = sorted(combined["meta"].keys())
     base_combined = combined["baseline"]
     dist_combined = combined["distilled"]
+    has_bm25 = bool(bm25_results)
+    has_tuned = bool(tuned_results)
+    has_dist_combined = bool(dist_combined)
 
     # Collect all datasets across all sources
-    all_datasets = set()
-    all_datasets.update(baseline.keys())
+    all_datasets = set(baseline.keys())
+    if bm25_results:
+        all_datasets.update(bm25_results.keys())
+    if tuned_results:
+        all_datasets.update(tuned_results.keys())
     for combo in combo_methods:
         all_datasets.update(base_combined.get(combo, {}).keys())
         all_datasets.update(dist_combined.get(combo, {}).keys())
@@ -141,10 +166,7 @@ def generate_report(baseline, combined, output_path):
         lines.append(f"**Normalization:** {meta['normalization']}")
         lines.append(f"**Alpha (BM25 weight):** {meta['alpha']}")
     lines.append("")
-    lines.append("**Legend:**")
-    lines.append("- **Base** = BAAI/bge-m3 dense retrieval only (no BM25)")
-    lines.append("- **Base+BM25** = BAAI/bge-m3 combined with BM25")
-    lines.append("- **Dist+BM25** = Distilled model combined with BM25")
+    lines.append("All values (except Base) are percentage change relative to Base.")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -153,25 +175,35 @@ def generate_report(baseline, combined, output_path):
         lines.append(f"## {metric_label}")
         lines.append("")
 
-        # Build header
+        # Build header dynamically
         header = "| Dataset | Base |"
         sep = "|---------|------|"
+
+        if has_bm25:
+            header += " BM25 |"
+            sep += "------|"
+
         for combo in combo_methods:
             label = combo.capitalize()[:5]
-            header += f" Base+BM25 ({label}) | {chr(916)} |"
-            sep += "------------|------|"
-            header += f" Dist+BM25 ({label}) | {chr(916)} |"
-            sep += "------------|------|"
+            header += f" Base+BM25 ({label}) |"
+            sep += "------|"
+
+        if has_tuned:
+            header += " Distilled |"
+            sep += "------|"
+
+        if has_dist_combined:
+            for combo in combo_methods:
+                label = combo.capitalize()[:5]
+                header += f" Dist+BM25 ({label}) |"
+                sep += "------|"
 
         lines.append(header)
         lines.append(sep)
 
         # Accumulators for averages
+        pct_accum = defaultdict(list)
         base_vals = []
-        base_combo_vals = {c: [] for c in combo_methods}
-        dist_combo_vals = {c: [] for c in combo_methods}
-        base_combo_deltas = {c: [] for c in combo_methods}
-        dist_combo_deltas = {c: [] for c in combo_methods}
 
         for dataset in all_datasets:
             display = DATASET_DISPLAY.get(dataset, dataset)
@@ -182,41 +214,59 @@ def generate_report(baseline, combined, output_path):
             if base_val is not None:
                 base_vals.append(base_val)
 
+            if has_bm25:
+                bm25_val = bm25_results.get(dataset, {}).get(metric_key)
+                pct = pct_delta(bm25_val, base_val)
+                row += f" {fmt_pct(pct)} |"
+                if pct is not None:
+                    pct_accum["bm25"].append(pct)
+
             for combo in combo_methods:
                 bc_val = base_combined.get(combo, {}).get(dataset, {}).get(metric_key)
-                dc_val = dist_combined.get(combo, {}).get(dataset, {}).get(metric_key)
+                pct = pct_delta(bc_val, base_val)
+                row += f" {fmt_pct(pct)} |"
+                if pct is not None:
+                    pct_accum[f"base_{combo}"].append(pct)
 
-                # Delta: base-combined vs base
-                bc_delta = (bc_val - base_val) if (bc_val is not None and base_val is not None) else None
-                # Delta: distilled-combined vs base-combined
-                dc_delta = (dc_val - bc_val) if (dc_val is not None and bc_val is not None) else None
+            if has_tuned:
+                tuned_val = tuned_results.get(dataset, {}).get(metric_key)
+                pct = pct_delta(tuned_val, base_val)
+                row += f" {fmt_pct(pct)} |"
+                if pct is not None:
+                    pct_accum["tuned"].append(pct)
 
-                row += f" {fmt(bc_val)} | {fmt_delta(bc_delta)} |"
-                row += f" {fmt(dc_val)} | {fmt_delta(dc_delta)} |"
-
-                if bc_val is not None:
-                    base_combo_vals[combo].append(bc_val)
-                if dc_val is not None:
-                    dist_combo_vals[combo].append(dc_val)
-                if bc_delta is not None:
-                    base_combo_deltas[combo].append(bc_delta)
-                if dc_delta is not None:
-                    dist_combo_deltas[combo].append(dc_delta)
+            if has_dist_combined:
+                for combo in combo_methods:
+                    dc_val = dist_combined.get(combo, {}).get(dataset, {}).get(metric_key)
+                    pct = pct_delta(dc_val, base_val)
+                    row += f" {fmt_pct(pct)} |"
+                    if pct is not None:
+                        pct_accum[f"dist_{combo}"].append(pct)
 
             lines.append(row)
 
         # Average row
+        def _avg_pct(key):
+            vals = pct_accum[key]
+            return sum(vals) / len(vals) if vals else None
+
         avg_base = sum(base_vals) / len(base_vals) if base_vals else None
         avg_row = f"| **Average** | {fmt(avg_base)} |"
-        for combo in combo_methods:
-            avg_bc = sum(base_combo_vals[combo]) / len(base_combo_vals[combo]) if base_combo_vals[combo] else None
-            avg_dc = sum(dist_combo_vals[combo]) / len(dist_combo_vals[combo]) if dist_combo_vals[combo] else None
-            avg_bc_d = sum(base_combo_deltas[combo]) / len(base_combo_deltas[combo]) if base_combo_deltas[combo] else None
-            avg_dc_d = sum(dist_combo_deltas[combo]) / len(dist_combo_deltas[combo]) if dist_combo_deltas[combo] else None
-            avg_row += f" {fmt(avg_bc)} | {fmt_delta(avg_bc_d)} |"
-            avg_row += f" {fmt(avg_dc)} | {fmt_delta(avg_dc_d)} |"
-        lines.append(avg_row)
 
+        if has_bm25:
+            avg_row += f" {fmt_pct(_avg_pct('bm25'))} |"
+
+        for combo in combo_methods:
+            avg_row += f" {fmt_pct(_avg_pct(f'base_{combo}'))} |"
+
+        if has_tuned:
+            avg_row += f" {fmt_pct(_avg_pct('tuned'))} |"
+
+        if has_dist_combined:
+            for combo in combo_methods:
+                avg_row += f" {fmt_pct(_avg_pct(f'dist_{combo}'))} |"
+
+        lines.append(avg_row)
         lines.append("")
 
     report = "\n".join(lines)
@@ -228,14 +278,20 @@ def generate_report(baseline, combined, output_path):
     return report
 
 
-def print_console_report(baseline, combined):
+def print_console_report(baseline, bm25_results, tuned_results, combined):
     """Print a console-friendly summary."""
     combo_methods = sorted(combined["meta"].keys())
     base_combined = combined["baseline"]
     dist_combined = combined["distilled"]
+    has_bm25 = bool(bm25_results)
+    has_tuned = bool(tuned_results)
+    has_dist_combined = bool(dist_combined)
 
-    all_datasets = set()
-    all_datasets.update(baseline.keys())
+    all_datasets = set(baseline.keys())
+    if bm25_results:
+        all_datasets.update(bm25_results.keys())
+    if tuned_results:
+        all_datasets.update(tuned_results.keys())
     for combo in combo_methods:
         all_datasets.update(base_combined.get(combo, {}).keys())
         all_datasets.update(dist_combined.get(combo, {}).keys())
@@ -243,17 +299,25 @@ def print_console_report(baseline, combined):
 
     print("\n" + "=" * 120)
     print("COMBINED BM25 + SEMANTIC EVALUATION REPORT")
+    print("All values (except Base) are % change relative to Base.")
     print("=" * 120)
 
     for metric_key, metric_label in [("ndcg@10", "NDCG@10"), ("recall@10", "Recall@10")]:
         print(f"\n--- {metric_label} ---\n")
 
-        # Header
+        # Build header
         header = f"{'Dataset':<20} {'Base':>8}"
+        if has_bm25:
+            header += f" {'BM25':>8}"
         for combo in combo_methods:
             label = combo[:5].capitalize()
-            header += f" {'B+BM25('+label+')':>16} {'Delta':>8}"
-            header += f" {'D+BM25('+label+')':>16} {'Delta':>8}"
+            header += f" {'B+BM25('+label+')':>16}"
+        if has_tuned:
+            header += f" {'Distilled':>10}"
+        if has_dist_combined:
+            for combo in combo_methods:
+                label = combo[:5].capitalize()
+                header += f" {'D+BM25('+label+')':>16}"
         print(header)
         print("-" * len(header))
 
@@ -261,14 +325,22 @@ def print_console_report(baseline, combined):
             base_val = baseline.get(dataset, {}).get(metric_key)
             row = f"{dataset:<20} {fmt(base_val):>8}"
 
+            if has_bm25:
+                bm25_val = bm25_results.get(dataset, {}).get(metric_key)
+                row += f" {fmt_pct(pct_delta(bm25_val, base_val)):>8}"
+
             for combo in combo_methods:
                 bc_val = base_combined.get(combo, {}).get(dataset, {}).get(metric_key)
-                dc_val = dist_combined.get(combo, {}).get(dataset, {}).get(metric_key)
-                bc_delta = (bc_val - base_val) if (bc_val is not None and base_val is not None) else None
-                dc_delta = (dc_val - bc_val) if (dc_val is not None and bc_val is not None) else None
+                row += f" {fmt_pct(pct_delta(bc_val, base_val)):>16}"
 
-                row += f" {fmt(bc_val):>16} {fmt_delta(bc_delta):>8}"
-                row += f" {fmt(dc_val):>16} {fmt_delta(dc_delta):>8}"
+            if has_tuned:
+                tuned_val = tuned_results.get(dataset, {}).get(metric_key)
+                row += f" {fmt_pct(pct_delta(tuned_val, base_val)):>10}"
+
+            if has_dist_combined:
+                for combo in combo_methods:
+                    dc_val = dist_combined.get(combo, {}).get(dataset, {}).get(metric_key)
+                    row += f" {fmt_pct(pct_delta(dc_val, base_val)):>16}"
 
             print(row)
 
@@ -289,6 +361,8 @@ Examples:
 
   python generate_combined_report.py \\
       --baseline-results results/tuned/baseline_results.json \\
+      --bm25-results results/bm25_baseline/bm25_results.json \\
+      --tuned-results results/distilled_gemma2_500steps/tuned_results.json \\
       --combined-dir results/combined-distilled \\
       --output results/combined-distilled/report.md
 """
@@ -299,6 +373,18 @@ Examples:
         type=Path,
         required=True,
         help="Path to baseline_results.json (standalone dense model, no BM25)"
+    )
+    parser.add_argument(
+        "--bm25-results",
+        type=Path,
+        default=None,
+        help="Path to BM25-only results JSON (optional, adds BM25 column)"
+    )
+    parser.add_argument(
+        "--tuned-results",
+        type=Path,
+        default=None,
+        help="Path to tuned/distilled model standalone results JSON (optional, adds Distilled column)"
     )
     parser.add_argument(
         "--combined-dir",
@@ -323,6 +409,8 @@ Examples:
 
     # Load data
     baseline = load_baseline_results(args.baseline_results)
+    bm25 = load_baseline_results(args.bm25_results) if args.bm25_results else {}
+    tuned = load_baseline_results(args.tuned_results) if args.tuned_results else {}
     combined = load_combined_results(args.combined_dir)
 
     if not combined["baseline"] and not combined["distilled"]:
@@ -330,10 +418,10 @@ Examples:
         return
 
     # Print console report
-    print_console_report(baseline, combined)
+    print_console_report(baseline, bm25, tuned, combined)
 
     # Generate markdown report
-    generate_report(baseline, combined, output_path)
+    generate_report(baseline, bm25, tuned, combined, output_path)
     print(f"\nMarkdown report saved to: {output_path}")
 
 

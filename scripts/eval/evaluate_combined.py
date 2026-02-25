@@ -49,6 +49,44 @@ from tqdm import tqdm
 
 
 # ============================================
+# Score Caching
+# ============================================
+
+def _model_path_to_cache_name(model_path: str) -> str:
+    """Convert model path to a safe directory name for caching."""
+    return model_path.strip("/").replace("/", "__")
+
+
+def _get_cache_path(cache_dir: Path, score_type: str, dataset: str,
+                    model_path: str | None, retrieval_depth: int) -> Path:
+    """Get the cache file path for a score type."""
+    if score_type == "bm25":
+        return cache_dir / "bm25" / dataset / f"k{retrieval_depth}.json"
+    else:  # semantic
+        model_name = _model_path_to_cache_name(model_path)
+        return cache_dir / "semantic" / model_name / dataset / f"k{retrieval_depth}.json"
+
+
+def _load_score_cache(path: Path) -> Dict[str, Dict[str, float]] | None:
+    """Load cached scores from JSON. Returns None if cache doesn't exist."""
+    if not path.exists():
+        return None
+    print(f"  Loading cached scores from: {path}")
+    with open(path, "r") as f:
+        data = json.load(f)
+    return data["scores"]
+
+
+def _save_score_cache(path: Path, scores: Dict[str, Dict[str, float]], metadata: dict) -> None:
+    """Save scores to JSON cache."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"metadata": metadata, "scores": scores}
+    with open(path, "w") as f:
+        json.dump(data, f)
+    print(f"  Cached scores saved to: {path}")
+
+
+# ============================================
 # Tokenization (matches evaluate_bm25.py)
 # ============================================
 
@@ -418,6 +456,7 @@ def evaluate_combined(
     dataset_name: str,
     data_dir: Path,
     model: SentenceTransformer,
+    model_path: str,
     normalization: str,
     combination: str,
     alpha: float,
@@ -425,6 +464,7 @@ def evaluate_combined(
     batch_size: int,
     tokenizer_batch_size: int,
     pool=None,
+    cache_dir: Path | None = None,
 ) -> EvalResult:
     """Evaluate combined BM25 + semantic search on a dataset."""
     print(f"\n{'='*60}")
@@ -450,24 +490,55 @@ def evaluate_combined(
     query_ids = list(queries.keys())
     query_texts = [queries[qid] for qid in query_ids]
 
-    # --- BM25 Retrieval ---
-    print("\nBuilding BM25 index...")
-    print("Tokenizing corpus...")
-    tokenized_corpus = tokenize_texts_batch(doc_texts, batch_size=tokenizer_batch_size)
+    # --- BM25 Retrieval (with caching) ---
+    bm25_results = None
+    if cache_dir is not None:
+        bm25_cache_path = _get_cache_path(cache_dir, "bm25", dataset_name, None, retrieval_depth)
+        bm25_results = _load_score_cache(bm25_cache_path)
 
-    retriever = bm25s.BM25()
-    retriever.index(tokenized_corpus)
+    if bm25_results is None:
+        print("\nBuilding BM25 index...")
+        print("Tokenizing corpus...")
+        tokenized_corpus = tokenize_texts_batch(doc_texts, batch_size=tokenizer_batch_size)
 
-    print("Tokenizing queries...")
-    tokenized_queries = tokenize_texts_batch(query_texts, batch_size=tokenizer_batch_size)
+        retriever = bm25s.BM25()
+        retriever.index(tokenized_corpus)
 
-    bm25_results = retrieve_bm25(query_ids, tokenized_queries, retriever, doc_ids, retrieval_depth)
+        print("Tokenizing queries...")
+        tokenized_queries = tokenize_texts_batch(query_texts, batch_size=tokenizer_batch_size)
 
-    # --- Semantic Retrieval ---
-    semantic_results = retrieve_semantic(
-        query_ids, query_texts, doc_ids, doc_texts,
-        model, retrieval_depth, batch_size, pool,
-    )
+        bm25_results = retrieve_bm25(query_ids, tokenized_queries, retriever, doc_ids, retrieval_depth)
+
+        if cache_dir is not None:
+            _save_score_cache(bm25_cache_path, bm25_results, {
+                "score_type": "bm25",
+                "dataset": dataset_name,
+                "retrieval_depth": retrieval_depth,
+                "num_queries": len(queries),
+                "num_corpus": len(corpus),
+            })
+
+    # --- Semantic Retrieval (with caching) ---
+    semantic_results = None
+    if cache_dir is not None:
+        semantic_cache_path = _get_cache_path(cache_dir, "semantic", dataset_name, model_path, retrieval_depth)
+        semantic_results = _load_score_cache(semantic_cache_path)
+
+    if semantic_results is None:
+        semantic_results = retrieve_semantic(
+            query_ids, query_texts, doc_ids, doc_texts,
+            model, retrieval_depth, batch_size, pool,
+        )
+
+        if cache_dir is not None:
+            _save_score_cache(semantic_cache_path, semantic_results, {
+                "score_type": "semantic",
+                "dataset": dataset_name,
+                "model_path": model_path,
+                "retrieval_depth": retrieval_depth,
+                "num_queries": len(queries),
+                "num_corpus": len(corpus),
+            })
 
     # --- Combine Scores ---
     print(f"\nCombining scores (normalization={normalization}, combination={combination}, alpha={alpha})...")
@@ -626,6 +697,17 @@ Examples:
         default=None,
         help="Output JSON file for results (optional)"
     )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=project_dir / "cache" / "scores",
+        help="Directory for caching BM25/semantic scores (default: cache/scores)"
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable score caching; recompute everything"
+    )
 
     args = parser.parse_args()
 
@@ -637,6 +719,9 @@ Examples:
     if not args.data_dir.exists():
         print(f"Error: Data directory not found: {args.data_dir}")
         sys.exit(1)
+
+    # Resolve cache directory
+    cache_dir = None if args.no_cache else args.cache_dir
 
     # Pre-load BM25 tokenizer
     get_tokenizer()
@@ -662,6 +747,7 @@ Examples:
                     dataset_name=dataset_name,
                     data_dir=args.data_dir,
                     model=model,
+                    model_path=args.model_path,
                     normalization=args.normalization,
                     combination=args.combination,
                     alpha=args.alpha,
@@ -669,6 +755,7 @@ Examples:
                     batch_size=args.batch_size,
                     tokenizer_batch_size=args.tokenizer_batch_size,
                     pool=pool,
+                    cache_dir=cache_dir,
                 )
                 results.append(result)
             except Exception as e:
