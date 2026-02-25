@@ -455,7 +455,7 @@ class EvalResult:
 def evaluate_combined(
     dataset_name: str,
     data_dir: Path,
-    model: SentenceTransformer,
+    model: SentenceTransformer | None,
     model_path: str,
     normalization: str,
     combination: str,
@@ -723,20 +723,43 @@ Examples:
     # Resolve cache directory
     cache_dir = None if args.no_cache else args.cache_dir
 
-    # Pre-load BM25 tokenizer
-    get_tokenizer()
+    # Probe caches upfront to avoid loading model/tokenizer unnecessarily
+    needs_bm25 = False
+    needs_semantic = False
+    if cache_dir is not None:
+        for dataset_name in args.datasets:
+            if not _get_cache_path(cache_dir, "bm25", dataset_name, None, args.retrieval_depth).exists():
+                needs_bm25 = True
+            if not _get_cache_path(cache_dir, "semantic", dataset_name, args.model_path, args.retrieval_depth).exists():
+                needs_semantic = True
+        if not needs_bm25 and not needs_semantic:
+            print("All BM25 and semantic scores cached — skipping model/tokenizer loading.")
+        else:
+            parts = []
+            if needs_bm25:
+                parts.append("BM25")
+            if needs_semantic:
+                parts.append("semantic")
+            print(f"Cache miss for some {' and '.join(parts)} scores, will compute as needed.")
+    else:
+        needs_bm25 = True
+        needs_semantic = True
 
-    # Load dense model
-    model = load_model(args.model_path, args.max_seq_length)
+    # Only load tokenizer if some BM25 scores need computing
+    if needs_bm25:
+        get_tokenizer()
 
-    # Start multi-GPU pool if multiple GPUs are available
-    num_gpus = torch.cuda.device_count()
+    # Only load dense model if some semantic scores need computing
+    model = None
     pool = None
-    if num_gpus > 1:
-        print(f"Starting multi-GPU encoding pool on {num_gpus} GPUs")
-        pool = model.start_multi_process_pool(
-            target_devices=[f"cuda:{i}" for i in range(num_gpus)]
-        )
+    if needs_semantic:
+        model = load_model(args.model_path, args.max_seq_length)
+        num_gpus = torch.cuda.device_count()
+        if num_gpus > 1:
+            print(f"Starting multi-GPU encoding pool on {num_gpus} GPUs")
+            pool = model.start_multi_process_pool(
+                target_devices=[f"cuda:{i}" for i in range(num_gpus)]
+            )
 
     # Evaluate on each dataset
     results = []

@@ -25,7 +25,7 @@ MODEL_DIR="$PROJECT_DIR/artifacts/models/distilled"
 # Configuration with environment variable overrides
 BASELINE_MODEL="${BASELINE_MODEL:-BAAI/bge-m3}"
 NORMALIZATION="${NORMALIZATION:-min_max}"
-ALPHA="${ALPHA:-0.2}"
+ALPHA="${ALPHA:-0.5}"
 RETRIEVAL_DEPTH="${RETRIEVAL_DEPTH:-1000}"
 
 COMBINATIONS=(arithmetic geometric harmonic)
