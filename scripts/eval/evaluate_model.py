@@ -31,6 +31,7 @@ from typing import Dict, Tuple
 
 import torch
 from sentence_transformers import SentenceTransformer
+from sentence_transformers.sparse_encoder import SparseEncoder
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
 
 
@@ -149,14 +150,18 @@ def evaluate_model(
 
     print(f"Queries: {len(queries)}, Corpus: {len(corpus)} documents")
 
-    # Create evaluator
+    # Create evaluator. For sparse models, reduce corpus_chunk_size because
+    # each embedding is vocab-sized (30,522 dims) and densified before scoring.
+    is_sparse = isinstance(model, SparseEncoder)
+    corpus_chunk_size = 10_000 if is_sparse else 50_000
     evaluator = InformationRetrievalEvaluator(
         queries=queries,
         corpus=corpus,
         relevant_docs=qrels,
         name=f"{dataset_name}-test",
         show_progress_bar=True,
-        batch_size=batch_size
+        batch_size=batch_size,
+        corpus_chunk_size=corpus_chunk_size,
     )
 
     # If a multi-GPU pool is available, patch the evaluator's embed_inputs
@@ -181,13 +186,36 @@ def evaluate_model(
 
         evaluator.embed_inputs = embed_inputs_with_pool
 
+    # SparseEncoder.encode() does not accept truncate_dim, and returns sparse
+    # COO tensors. The default evaluator passes truncate_dim (rejected by
+    # SparseEncoder), and dot_score's torch.mm on two sparse COO tensors
+    # triggers cusparseSpGEMM which needs huge workspace buffers, causing OOM.
+    # Fix both: strip truncate_dim and densify embeddings so dot_score uses
+    # efficient dense GEMM instead.
+    if is_sparse and pool is None:
+
+        def embed_inputs_sparse(model, sentences, *, is_query=False, convert_to_tensor=True, **kwargs):
+            encode_fn = model.encode_query if is_query else model.encode
+            embs = encode_fn(
+                sentences,
+                batch_size=batch_size,
+                show_progress_bar=True,
+                convert_to_tensor=convert_to_tensor,
+            )
+            if embs.is_sparse:
+                embs = embs.to_dense()
+            return embs
+
+        evaluator.embed_inputs = embed_inputs_sparse
+
     # Run evaluation
     results = evaluator(model)
 
-    # Extract metrics
-    ndcg_key = f"{dataset_name}-test_cosine_ndcg@10"
-    mrr_key = f"{dataset_name}-test_cosine_mrr@10"
-    recall_key = f"{dataset_name}-test_cosine_recall@10"
+    # Extract metrics -- key prefix comes from model.similarity_fn_name (e.g. "cosine" or "dot")
+    sim_name = model.similarity_fn_name.value if hasattr(model.similarity_fn_name, "value") else str(model.similarity_fn_name)
+    ndcg_key = f"{dataset_name}-test_{sim_name}_ndcg@10"
+    mrr_key = f"{dataset_name}-test_{sim_name}_mrr@10"
+    recall_key = f"{dataset_name}-test_{sim_name}_recall@10"
 
     ndcg = results.get(ndcg_key, 0.0)
     mrr = results.get(mrr_key, 0.0)
@@ -208,19 +236,21 @@ def evaluate_model(
     )
 
 
-def load_model(model_path: str, max_seq_length: int):
+def load_model(model_path: str, max_seq_length: int, sparse: bool = False):
     """Load a model for evaluation.
 
     Args:
         model_path: Path to saved model or HuggingFace model name
         max_seq_length: Maximum sequence length
+        sparse: If True, load as SparseEncoder instead of SentenceTransformer
 
     Returns:
-        Loaded SentenceTransformer model
+        Loaded SentenceTransformer or SparseEncoder model
     """
-    print(f"Loading model: {model_path}")
+    print(f"Loading {'sparse' if sparse else 'dense'} model: {model_path}")
 
-    model = SentenceTransformer(model_path, trust_remote_code=True)
+    cls = SparseEncoder if sparse else SentenceTransformer
+    model = cls(model_path, trust_remote_code=True)
     model.max_seq_length = max_seq_length
 
     return model
@@ -313,6 +343,11 @@ Examples:
         default=None,
         help="Output JSON file for results (optional)"
     )
+    parser.add_argument(
+        "--sparse",
+        action="store_true",
+        help="Load as a SparseEncoder (SPLADE) model instead of a dense SentenceTransformer"
+    )
 
     args = parser.parse_args()
 
@@ -322,12 +357,13 @@ Examples:
         sys.exit(1)
 
     # Load model
-    model = load_model(args.model_path, args.max_seq_length)
+    model = load_model(args.model_path, args.max_seq_length, sparse=args.sparse)
 
-    # Start multi-GPU pool if multiple GPUs are available
+    # Start multi-GPU pool if multiple GPUs are available.
+    # Skipped for sparse models: the pool bypasses asymmetric query/document routing.
     num_gpus = torch.cuda.device_count()
     pool = None
-    if num_gpus > 1:
+    if num_gpus > 1 and not args.sparse:
         print(f"Starting multi-GPU encoding pool on {num_gpus} GPUs")
         pool = model.start_multi_process_pool(
             target_devices=[f"cuda:{i}" for i in range(num_gpus)]
