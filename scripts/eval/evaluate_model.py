@@ -251,7 +251,7 @@ def load_model(model_path: str, max_seq_length: int, sparse: bool = False):
 
     cls = SparseEncoder if sparse else SentenceTransformer
     model = cls(model_path, trust_remote_code=True)
-    model.max_seq_length = max_seq_length
+    model.max_seq_length = min(max_seq_length, model.max_seq_length)
 
     return model
 
