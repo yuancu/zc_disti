@@ -33,13 +33,17 @@ DATASET_TO_MTEB_TASK = {
 }
 
 
-def load_and_convert(jsonl_path: str, num_negatives: int, teacher_score_scale_factor: float, topN: int = None):
+def load_and_convert(jsonl_path: str, num_negatives: int, teacher_score_scale_factor: float, topN: int = None, normalize_scores: bool = True):
     """Load teacher-scored data and convert to (query, positive, negative1, ..., negativeK) format.
 
     Identical to the dense version -- the data format is model-agnostic.
     teacher_score_scale_factor controls the peakedness of the teacher softmax distribution.
     For sparse models with dot-product similarity (larger magnitude student scores),
     this should be much larger than for dense cosine models (default 1.0 vs 0.025).
+
+    When normalize_scores is True, teacher scores are standardized (zero mean, unit
+    variance) per-dataset before applying teacher_score_scale_factor.  This makes
+    the scale factor portable across datasets with different raw score ranges.
     """
     queries, positives, labels = [], [], []
     negatives_cols = {f"negative{i+1}": [] for i in range(num_negatives)}
@@ -47,6 +51,19 @@ def load_and_convert(jsonl_path: str, num_negatives: int, teacher_score_scale_fa
     n_skipped = 0
     with open(jsonl_path, "r", encoding="utf-8") as f:
         data_array = json.load(f)
+
+    # Compute per-dataset score statistics for normalization
+    if normalize_scores:
+        all_scores = [s for ex in data_array for s in ex["scores"]]
+        mu = sum(all_scores) / len(all_scores)
+        std = (sum((s - mu) ** 2 for s in all_scores) / len(all_scores)) ** 0.5
+        std = max(std, 1e-8)
+        print(f"Teacher score normalization: mean={mu:.4f}, std={std:.4f}")
+    else:
+        mu, std = 0.0, 1.0
+
+    def scale(raw_score: float) -> float:
+        return ((raw_score - mu) / std) * teacher_score_scale_factor
 
     for ex in data_array:
         q = ex["query"]
@@ -81,8 +98,8 @@ def load_and_convert(jsonl_path: str, num_negatives: int, teacher_score_scale_fa
             queries.append(q)
             positives.append(pos_doc)
             labels.append(
-                [pos_score * teacher_score_scale_factor]
-                + [s * teacher_score_scale_factor for (_, s) in chunk]
+                [scale(pos_score)]
+                + [scale(s) for (_, s) in chunk]
             )
             for i, (neg_doc, _) in enumerate(chunk):
                 negatives_cols[f"negative{i+1}"].append(neg_doc)
@@ -160,15 +177,22 @@ def parse_args():
     parser.add_argument(
         "--teacher_score_scale_factor",
         type=float,
-        default=1.0,
-        help="Scaling factor for teacher scores. Sparse models use dot-product similarity "
-             "(scores in 0..hundreds) unlike dense cosine similarity (-1..1), so this should "
-             "be much larger than the dense default of 0.025. (default: 1.0)"
+        default=2.0,
+        help="Scaling factor for teacher scores, applied after optional normalization. "
+             "(default: 2.0)"
+    )
+    parser.add_argument(
+        "--normalize_scores",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Standardize teacher scores (zero mean, unit variance) per-dataset before "
+             "applying teacher_score_scale_factor. Makes the scale factor portable across "
+             "datasets with different raw score ranges. (default: True)"
     )
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=5e-6,
+        default=2e-5,
         help="Learning rate (default: 5e-6)"
     )
     parser.add_argument(
@@ -274,6 +298,7 @@ def main():
         args.num_negatives,
         args.teacher_score_scale_factor,
         args.topN,
+        normalize_scores=args.normalize_scores,
     )
 
     model = SparseEncoder(args.model_name, trust_remote_code=True)
