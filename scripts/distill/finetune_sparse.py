@@ -342,6 +342,13 @@ def parse_args():
              "ratio rather than an absolute weight. Makes regularization strength "
              "dataset-agnostic. (default: False)"
     )
+    parser.add_argument(
+        "--symmetric",
+        action="store_true",
+        help="Symmetric (bi-encoder) sparse model where both query and document use "
+             "the same neural MLM encoder (e.g., opensearch-neural-sparse-encoding-v2-distill). "
+             "Disables router_mapping and query-encoder freezing. (default: False)"
+    )
 
     return parser.parse_args()
 
@@ -376,17 +383,23 @@ def main():
     model = SparseEncoder(args.model_name, trust_remote_code=True)
     model.max_seq_length = args.max_seq_length
 
-    # Freeze the inference-free query encoder (SparseStaticEmbedding / IDF weights).
-    # These are not trainable and MUST be excluded from DDP tracking: SpladeLoss calls
-    # model() multiple times per step (once for query, once per document), and with
-    # find_unused_parameters=True DDP marks query params as "ready" after the first
-    # call then errors when the subsequent document calls trigger the hooks again.
-    n_frozen = 0
-    for name, param in model.named_parameters():
-        if "sub_modules" in name and "query" in name:
-            param.requires_grad = False
-            n_frozen += 1
-    print(f"Froze {n_frozen} query-encoder parameters (inference-free IDF weights)")
+    # For asymmetric models (doc-v3-gte), freeze the inference-free query encoder
+    # (SparseStaticEmbedding / IDF weights). These are not trainable and MUST be
+    # excluded from DDP tracking: SpladeLoss calls model() multiple times per step
+    # (once for query, once per document), and with find_unused_parameters=True DDP
+    # marks query params as "ready" after the first call then errors when the
+    # subsequent document calls trigger the hooks again.
+    # For symmetric models (v2-distill), both encoders are the same neural MLM —
+    # nothing to freeze.
+    if not args.symmetric:
+        n_frozen = 0
+        for name, param in model.named_parameters():
+            if "sub_modules" in name and "query" in name:
+                param.requires_grad = False
+                n_frozen += 1
+        print(f"Froze {n_frozen} query-encoder parameters (inference-free IDF weights)")
+    else:
+        print("Symmetric mode: all parameters are trainable")
 
     # SparseDistillKLDivLoss uses dot-product similarity by default.
     # It MUST be wrapped in SpladeLoss which handles the forward pass and FLOPS regularization.
@@ -411,12 +424,14 @@ def main():
         args.max_steps, len(train_dataset), args.train_batch_size, args.gradient_accumulation_steps
     )
 
-    # Build router_mapping so the trainer routes "query" columns through
-    # SparseStaticEmbedding and "positive"/"negative*" columns through
-    # MLMTransformer + SpladePooling.
-    router_mapping = build_router_mapping(args.num_negatives)
+    # For asymmetric models, build router_mapping so the trainer routes "query"
+    # columns through SparseStaticEmbedding and "positive"/"negative*" columns
+    # through MLMTransformer + SpladePooling.
+    # For symmetric models, no router_mapping is needed — all columns use the
+    # same encoder.
+    router_mapping = None if args.symmetric else build_router_mapping(args.num_negatives)
 
-    training_args = SparseEncoderTrainingArguments(
+    training_args_kwargs = dict(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
         max_steps=effective_max_steps,
@@ -430,8 +445,11 @@ def main():
         save_total_limit=args.save_total_limit,
         dataloader_drop_last=True,
         ddp_find_unused_parameters=False,
-        router_mapping=router_mapping,
     )
+    if router_mapping is not None:
+        training_args_kwargs["router_mapping"] = router_mapping
+
+    training_args = SparseEncoderTrainingArguments(**training_args_kwargs)
 
     trainer = SparseEncoderTrainer(
         model=model,
