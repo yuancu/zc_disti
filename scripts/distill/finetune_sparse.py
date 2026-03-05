@@ -120,6 +120,70 @@ def build_router_mapping(num_negatives: int) -> dict[str, str]:
     return mapping
 
 
+class AdaptiveSpladeLoss(losses.SpladeLoss):
+    """SpladeLoss with adaptive regularization weight.
+
+    Instead of a fixed lambda, scales the FLOPS regularization weight proportionally
+    to the base (KL) loss magnitude.  This keeps the ratio between ranking signal and
+    regularization constant regardless of dataset characteristics.
+
+    At each step:
+        effective_lambda = document_regularizer_weight * EMA(base_loss / flops_loss)
+
+    ``document_regularizer_weight`` becomes a dimensionless ratio (e.g. 0.1 means
+    "FLOPS contributes 10% of the KL gradient magnitude") rather than an absolute
+    weight that needs per-dataset tuning.
+    """
+
+    def __init__(self, *args, ema_decay: float = 0.99, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ema_decay = ema_decay
+        self.ema_ratio: float | None = None
+
+    def forward(self, sentence_features, labels=None):
+        embeddings = [
+            self.model(sentence_feature)["sentence_embedding"]
+            for sentence_feature in sentence_features
+        ]
+
+        loss_dict = {}
+        base_loss = self.loss.compute_loss_from_embeddings(embeddings, labels)
+        if isinstance(base_loss, dict):
+            loss_dict.update(base_loss)
+            base_loss_value = sum(base_loss.values())
+        else:
+            loss_dict["base_loss"] = base_loss
+            base_loss_value = base_loss
+
+        if self.use_document_regularizer_only:
+            corpus_loss = self.document_regularizer.compute_loss_from_embeddings(
+                torch.cat(embeddings)
+            )
+        else:
+            corpus_loss = self.document_regularizer.compute_loss_from_embeddings(
+                torch.cat(embeddings[1:])
+            )
+
+        # Compute per-step ratio and smooth with EMA
+        ratio = base_loss_value.detach().item() / max(corpus_loss.detach().item(), 1e-8)
+        if self.ema_ratio is None:
+            self.ema_ratio = ratio
+        else:
+            self.ema_ratio = self.ema_decay * self.ema_ratio + (1 - self.ema_decay) * ratio
+
+        loss_dict["document_regularizer_loss"] = (
+            corpus_loss * self.document_regularizer_weight * self.ema_ratio
+        )
+
+        if self.query_regularizer_weight is not None:
+            query_loss = self.query_regularizer.compute_loss_from_embeddings(embeddings[0])
+            loss_dict["query_regularizer_loss"] = (
+                query_loss * self.query_regularizer_weight * self.ema_ratio
+            )
+
+        return loss_dict
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Fine-tune a SPLADE sparse retrieval model using KL divergence distillation"
@@ -270,6 +334,14 @@ def parse_args():
              "Not needed for inference-free query models like the OpenSearch sparse "
              "encoders since their query path has no trainable parameters. (default: None)"
     )
+    parser.add_argument(
+        "--adaptive_regularizer",
+        action="store_true",
+        help="Scale FLOPS regularization weight proportionally to the base (KL) loss "
+             "magnitude so that document_regularizer_weight acts as a dimensionless "
+             "ratio rather than an absolute weight. Makes regularization strength "
+             "dataset-agnostic. (default: False)"
+    )
 
     return parser.parse_args()
 
@@ -323,7 +395,8 @@ def main():
         similarity_fct=util.pairwise_dot_score,
         temperature=args.temperature,
     )
-    train_loss = losses.SpladeLoss(
+    loss_cls = AdaptiveSpladeLoss if args.adaptive_regularizer else losses.SpladeLoss
+    train_loss = loss_cls(
         model=model,
         loss=inner_loss,
         document_regularizer_weight=args.document_regularizer_weight,
@@ -331,6 +404,8 @@ def main():
         # is not needed since the query encoder has no trainable parameters.
         query_regularizer_weight=args.query_regularizer_weight,
     )
+    if args.adaptive_regularizer:
+        print(f"Using adaptive FLOPS regularization (ratio={args.document_regularizer_weight})")
 
     effective_max_steps = cap_max_steps(
         args.max_steps, len(train_dataset), args.train_batch_size, args.gradient_accumulation_steps
