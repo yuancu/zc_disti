@@ -88,14 +88,23 @@ def encode_texts(
     model: SentenceTransformer,
     texts: list[str],
     batch_size: int = 256,
+    pool: dict | None = None,
 ) -> np.ndarray:
     """Encode texts using the sentence transformer model with L2 normalization."""
-    embeddings = model.encode(
-        texts,
-        batch_size=batch_size,
-        show_progress_bar=True,
-        normalize_embeddings=True,
-    )
+    if pool is not None:
+        embeddings = model.encode_multi_process(
+            texts,
+            pool=pool,
+            batch_size=batch_size,
+            normalize_embeddings=True,
+        )
+    else:
+        embeddings = model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            normalize_embeddings=True,
+        )
     return embeddings.astype(np.float32)
 
 
@@ -143,6 +152,7 @@ def parse_bedrock_output_with_negatives(
     datasets: Optional[list[str]] = None,
     num_negatives: int = 20,
     batch_size: int = 256,
+    num_gpus: int = 1,
 ):
     """
     Parse Bedrock batch output and generate training samples with semantic hard negatives.
@@ -167,6 +177,13 @@ def parse_bedrock_output_with_negatives(
     print(f"Loading model: {model_name}...")
     model = SentenceTransformer(model_name)
     print(f"Model loaded. Embedding dimension: {model.get_sentence_embedding_dimension()}")
+
+    pool = None
+    if num_gpus > 1:
+        print(f"Starting multi-process pool with {num_gpus} GPUs...")
+        target_devices = [f"cuda:{i}" for i in range(num_gpus)]
+        pool = model.start_multi_process_pool(target_devices=target_devices)
+        print(f"Multi-process pool started on devices: {target_devices}")
     print()
 
     total_samples = 0
@@ -200,7 +217,7 @@ def parse_bedrock_output_with_negatives(
 
         # Encode corpus
         print("Encoding corpus documents...")
-        doc_embeddings = encode_texts(model, doc_texts, batch_size=batch_size)
+        doc_embeddings = encode_texts(model, doc_texts, batch_size=batch_size, pool=pool)
         print(f"Corpus encoded: {doc_embeddings.shape}")
 
         # Build FAISS index
@@ -261,7 +278,7 @@ def parse_bedrock_output_with_negatives(
         positive_doc_texts = [pair["doc_text"] for pair in query_doc_pairs]
 
         print("Encoding queries...")
-        query_embeddings = encode_texts(model, queries, batch_size=batch_size)
+        query_embeddings = encode_texts(model, queries, batch_size=batch_size, pool=pool)
         print(f"Queries encoded: {query_embeddings.shape}")
 
         # Get hard negatives
@@ -300,6 +317,9 @@ def parse_bedrock_output_with_negatives(
 
         # Free memory
         del doc_embeddings, query_embeddings, index
+
+    if pool is not None:
+        model.stop_multi_process_pool(pool)
 
     print(f"{'='*60}")
     print(f"Total training samples across all datasets: {total_samples}")
@@ -353,6 +373,12 @@ def main():
         default=256,
         help="Batch size for encoding (default: 256)",
     )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs for multi-process encoding (default: 1)",
+    )
 
     args = parser.parse_args()
 
@@ -364,6 +390,7 @@ def main():
         datasets=args.datasets,
         num_negatives=args.num_negatives,
         batch_size=args.batch_size,
+        num_gpus=args.num_gpus,
     )
 
 
