@@ -5,14 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 INPUT_DIR="$PROJECT_DIR/artifacts/teacher-score-gemma2-seeded"
-OUTPUT_DIR="$PROJECT_DIR/artifacts/models/distilled-sparse-multilingual-500steps-seeded"
+OUTPUT_DIR="$PROJECT_DIR/artifacts/models/distilled-sparse-multilingual-1epoch-seeded"
 
 # MODEL_NAME="opensearch-project/opensearch-neural-sparse-encoding-doc-v3-gte"
 MODEL_NAME="opensearch-project/opensearch-neural-sparse-encoding-multilingual-v1"
-NUM_GPUS=3
+NUM_GPUS=4
 
-# DATASETS=("multi-cpr-video")
-DATASETS=("multi-cpr-ecom" "multi-cpr-medical" "cure_v1" "aila-casedocs" "financebench" "finqa" "hc3finance" "legalquad" "legal-summ")
+# DATASETS=("multi-cpr-video") "multi-cpr-ecom" "multi-cpr-medical"
+DATASETS=("cure_v1" "aila-casedocs" "financebench" "finqa" "hc3finance" "legalquad" "legal-summ")
 
 mkdir -p "$OUTPUT_DIR"
 
