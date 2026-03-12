@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 from datasets import Dataset
+from transformers import TrainerCallback
 
 from sentence_transformers import util
 from sentence_transformers.sparse_encoder import (
@@ -111,10 +112,17 @@ def load_and_convert(jsonl_path: str, num_negatives: int, teacher_score_scale_fa
     return ds
 
 
-def build_router_mapping(num_negatives: int) -> dict[str, str]:
-    """Build router_mapping to route queries through SparseStaticEmbedding
-    and documents through MLMTransformer+SpladePooling."""
-    mapping = {"query": "query", "positive": "document"}
+def build_router_mapping(num_negatives: int, symmetric: bool = False) -> dict[str, str]:
+    """Build router_mapping for the SparseEncoderTrainer.
+
+    In asymmetric (inference-free) mode, queries are routed through
+    SparseStaticEmbedding and documents through MLMTransformer+SpladePooling.
+
+    In symmetric (bi-encoder) mode, ALL columns (including query) are routed
+    through the document path (MLMTransformer+SpladePooling).
+    """
+    query_route = "document" if symmetric else "query"
+    mapping = {"query": query_route, "positive": "document"}
     for i in range(num_negatives):
         mapping[f"negative{i+1}"] = "document"
     return mapping
@@ -182,6 +190,36 @@ class AdaptiveSpladeLoss(losses.SpladeLoss):
             )
 
         return loss_dict
+
+
+class FlopsWarmupCallback(TrainerCallback):
+    """Quadratic warmup for FLOPS regularization weights.
+
+    Ramps document_regularizer_weight (and optionally query_regularizer_weight)
+    from 0 to their target values over warmup_steps using a quadratic schedule,
+    matching the opensearch-sparse-model-tuning-sample reference implementation.
+    """
+
+    def __init__(self, loss, target_doc_weight, target_query_weight=None, warmup_steps=200):
+        self.loss = loss
+        self.target_doc_weight = target_doc_weight
+        self.target_query_weight = target_query_weight
+        self.warmup_steps = warmup_steps
+
+    def _scale(self, target, global_step):
+        if global_step >= self.warmup_steps:
+            return target
+        step = global_step + 1
+        return target * (step / self.warmup_steps) ** 2
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        self.loss.document_regularizer_weight = self._scale(
+            self.target_doc_weight, state.global_step
+        )
+        if self.target_query_weight is not None:
+            self.loss.query_regularizer_weight = self._scale(
+                self.target_query_weight, state.global_step
+            )
 
 
 def parse_args():
@@ -335,6 +373,14 @@ def parse_args():
              "encoders since their query path has no trainable parameters. (default: None)"
     )
     parser.add_argument(
+        "--flops_warmup_steps",
+        type=int,
+        default=0,
+        help="Quadratic warmup steps for FLOPS regularization weight. Lambda ramps "
+             "from 0 to target over this many steps. Reference opensearch-sparse-model-"
+             "tuning-sample uses 200. (default: 0, no warmup)"
+    )
+    parser.add_argument(
         "--adaptive_regularizer",
         action="store_true",
         help="Scale FLOPS regularization weight proportionally to the base (KL) loss "
@@ -420,16 +466,28 @@ def main():
     if args.adaptive_regularizer:
         print(f"Using adaptive FLOPS regularization (ratio={args.document_regularizer_weight})")
 
+    callbacks = []
+    if args.flops_warmup_steps > 0:
+        callbacks.append(FlopsWarmupCallback(
+            loss=train_loss,
+            target_doc_weight=args.document_regularizer_weight,
+            target_query_weight=args.query_regularizer_weight,
+            warmup_steps=args.flops_warmup_steps,
+        ))
+        train_loss.document_regularizer_weight = 0.0
+        if args.query_regularizer_weight is not None:
+            train_loss.query_regularizer_weight = 0.0
+        print(f"FLOPS warmup: quadratic ramp over {args.flops_warmup_steps} steps")
+
     effective_max_steps = cap_max_steps(
         args.max_steps, len(train_dataset), args.train_batch_size, args.gradient_accumulation_steps
     )
 
-    # For asymmetric models, build router_mapping so the trainer routes "query"
-    # columns through SparseStaticEmbedding and "positive"/"negative*" columns
-    # through MLMTransformer + SpladePooling.
-    # For symmetric models, no router_mapping is needed — all columns use the
-    # same encoder.
-    router_mapping = None if args.symmetric else build_router_mapping(args.num_negatives)
+    # Build router_mapping: in asymmetric mode, queries go through
+    # SparseStaticEmbedding; in symmetric mode, everything goes through
+    # MLMTransformer+SpladePooling (the "document" route).
+    # The mapping is ALWAYS required when the model has a Router module.
+    router_mapping = build_router_mapping(args.num_negatives, symmetric=args.symmetric)
 
     training_args_kwargs = dict(
         output_dir=args.output_dir,
@@ -444,10 +502,12 @@ def main():
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
         dataloader_drop_last=True,
-        ddp_find_unused_parameters=False,
+        # In symmetric mode, SparseStaticEmbedding exists but receives no inputs
+        # (everything routes to "document"), so DDP must tolerate unused parameters.
+        # In asymmetric mode, query params are frozen so DDP can be strict.
+        ddp_find_unused_parameters=args.symmetric,
+        router_mapping=router_mapping,
     )
-    if router_mapping is not None:
-        training_args_kwargs["router_mapping"] = router_mapping
 
     training_args = SparseEncoderTrainingArguments(**training_args_kwargs)
 
@@ -456,6 +516,7 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         loss=train_loss,
+        callbacks=callbacks or None,
     )
 
     trainer.train()

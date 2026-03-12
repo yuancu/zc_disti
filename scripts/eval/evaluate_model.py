@@ -122,6 +122,7 @@ def evaluate_model(
     data_dir: Path,
     batch_size: int,
     pool=None,
+    symmetric: bool = False,
 ) -> EvalResult:
     """Evaluate a model on a dataset.
 
@@ -192,18 +193,46 @@ def evaluate_model(
     # triggers cusparseSpGEMM which needs huge workspace buffers, causing OOM.
     # Fix both: strip truncate_dim and densify embeddings so dot_score uses
     # efficient dense GEMM instead.
-    if is_sparse and pool is None:
+    if is_sparse:
 
-        def embed_inputs_sparse(model, sentences, *, is_query=False, convert_to_tensor=True, **kwargs):
-            encode_fn = model.encode_query if is_query else model.encode
-            embs = encode_fn(
-                sentences,
-                batch_size=batch_size,
-                show_progress_bar=True,
-                convert_to_tensor=convert_to_tensor,
-            )
-            if embs.is_sparse:
+        def embed_inputs_sparse(model, sentences, *, encode_fn_name=None, convert_to_tensor=True, **kwargs):
+            # InformationRetrievalEvaluator passes encode_fn_name="query" for queries
+            # and encode_fn_name="document" for documents.
+            is_query = (encode_fn_name == "query")
+
+            # In symmetric mode, queries go through encode_document (MLMTransformer)
+            # instead of encode_query (SparseStaticEmbedding / IDF lookup).
+            if is_query and not symmetric:
+                # Inference-free: query via SparseStaticEmbedding
+                embs = model.encode_query(
+                    sentences,
+                    batch_size=batch_size,
+                    show_progress_bar=True,
+                    convert_to_tensor=convert_to_tensor,
+                )
+            else:
+                # Document encoding, or symmetric query encoding — both use MLMTransformer.
+                # Must use encode_document (not bare encode) to explicitly set task="document"
+                # so the Router routes to MLMTransformer+SpladePooling.
+                if pool is not None:
+                    embs = model.encode_document(
+                        sentences,
+                        pool=pool,
+                        batch_size=batch_size,
+                        show_progress_bar=True,
+                        convert_to_tensor=convert_to_tensor,
+                    )
+                else:
+                    embs = model.encode_document(
+                        sentences,
+                        batch_size=batch_size,
+                        show_progress_bar=True,
+                        convert_to_tensor=convert_to_tensor,
+                    )
+            if hasattr(embs, 'is_sparse') and embs.is_sparse:
                 embs = embs.to_dense()
+            elif not isinstance(embs, torch.Tensor):
+                embs = torch.tensor(embs)
             return embs
 
         evaluator.embed_inputs = embed_inputs_sparse
@@ -348,6 +377,12 @@ Examples:
         action="store_true",
         help="Load as a SparseEncoder (SPLADE) model instead of a dense SentenceTransformer"
     )
+    parser.add_argument(
+        "--symmetric",
+        action="store_true",
+        help="Use the document encoder (MLMTransformer) for queries too, instead of "
+             "the inference-free SparseStaticEmbedding. Only relevant with --sparse."
+    )
 
     args = parser.parse_args()
 
@@ -360,10 +395,10 @@ Examples:
     model = load_model(args.model_path, args.max_seq_length, sparse=args.sparse)
 
     # Start multi-GPU pool if multiple GPUs are available.
-    # Skipped for sparse models: the pool bypasses asymmetric query/document routing.
+    # For sparse models, the pool is only used for document encoding (not queries).
     num_gpus = torch.cuda.device_count()
     pool = None
-    if num_gpus > 1 and not args.sparse:
+    if num_gpus > 1:
         print(f"Starting multi-GPU encoding pool on {num_gpus} GPUs")
         pool = model.start_multi_process_pool(
             target_devices=[f"cuda:{i}" for i in range(num_gpus)]
@@ -380,6 +415,7 @@ Examples:
                     data_dir=args.data_dir,
                     batch_size=args.batch_size,
                     pool=pool,
+                    symmetric=args.symmetric,
                 )
                 results.append(result)
             except Exception as e:
@@ -417,3 +453,4 @@ Examples:
 
 if __name__ == "__main__":
     main()
+
