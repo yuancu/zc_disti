@@ -1,171 +1,146 @@
 """SageMaker entry point for sparse model evaluation.
 
+Thin wrapper around scripts/eval/evaluate_model.py — all evaluation logic
+lives there. This script only handles SageMaker-specific concerns:
+  - Extracting model from tar.gz
+  - Finding model root directory
+  - Adapting SageMaker channel layout to evaluate_model's expected data layout
+  - Saving results to SM_MODEL_DIR
+
 Channels:
-- /opt/ml/input/data/eval/     — eval dataset (corpus.jsonl, queries.jsonl, relevance.jsonl)
-- /opt/ml/input/data/model/    — trained model (extracted from model.tar.gz)
-- /opt/ml/input/data/baseline/ — baseline model (extracted from model.tar.gz), optional
+- /opt/ml/input/data/eval/     -- eval dataset (corpus.jsonl, queries.jsonl, relevance.jsonl)
+- /opt/ml/input/data/model/    -- trained model (extracted from model.tar.gz)
 
 Output:
-- /opt/ml/model/results.json   — evaluation metrics
+- /opt/ml/model/results.json   -- evaluation metrics
 """
 
 import argparse
 import json
 import os
-import sys
+import tarfile
 from pathlib import Path
 
-import torch
-from sentence_transformers.sparse_encoder import SparseEncoder
-from sentence_transformers.evaluation import InformationRetrievalEvaluator
+# evaluate_model.py is packaged alongside this script in the SM source tarball.
+from evaluate_model import evaluate_model, load_model
 
 
-def load_eval_data(data_dir: Path):
-    corpus = {}
-    with open(data_dir / "corpus.jsonl", "r") as f:
-        for line in f:
-            doc = json.loads(line.strip())
-            doc_id = doc.get("_id") or doc.get("id")
-            text = doc.get("text", "")
-            title = doc.get("title", "")
-            corpus[doc_id] = f"{title} {text}".strip() if title else text
-
-    queries = {}
-    with open(data_dir / "queries.jsonl", "r") as f:
-        for line in f:
-            q = json.loads(line.strip())
-            qid = q.get("_id") or q.get("id")
-            queries[qid] = q["text"]
-
-    qrels = {}
-    with open(data_dir / "relevance.jsonl", "r") as f:
-        for line in f:
-            rel = json.loads(line.strip())
-            qid = str(rel["query-id"])
-            did = str(rel["corpus-id"])
-            score = int(rel["score"])
-            if qid not in qrels:
-                qrels[qid] = {}
-            qrels[qid][did] = score
-
-    return queries, corpus, qrels
+def find_model_root(model_path: Path) -> Path:
+    """Find the SparseEncoder model root directory."""
+    st_configs = list(model_path.rglob("config_sentence_transformers.json"))
+    if st_configs:
+        return st_configs[0].parent
+    modules = list(model_path.rglob("modules.json"))
+    if modules:
+        return modules[0].parent
+    if (model_path / "config.json").exists():
+        return model_path
+    config_files = list(model_path.rglob("config.json"))
+    if config_files:
+        return config_files[0].parent
+    return model_path
 
 
-def evaluate_model(model, dataset_name, queries, corpus, qrels, batch_size):
-    queries = {qid: q for qid, q in queries.items() if qid in qrels}
-    print(f"Evaluating {dataset_name}: {len(queries)} queries, {len(corpus)} docs")
+def extract_if_tarball(model_path: Path) -> Path:
+    """Extract tar.gz if present, return usable model path."""
+    tar_files = list(model_path.glob("*.tar.gz"))
+    if tar_files:
+        tar_file = tar_files[0]
+        print(f"Extracting {tar_file}...")
+        extract_dir = Path("/tmp/trained_model")
+        if extract_dir.exists():
+            import shutil
+            shutil.rmtree(extract_dir)
+        extract_dir.mkdir(parents=True)
+        with tarfile.open(tar_file, "r:gz") as tar:
+            tar.extractall(extract_dir)
+        return extract_dir
+    return model_path
 
-    evaluator = InformationRetrievalEvaluator(
-        queries=queries,
-        corpus=corpus,
-        relevant_docs=qrels,
-        name=f"{dataset_name}-test",
-        show_progress_bar=True,
-        batch_size=batch_size,
-        corpus_chunk_size=10_000,
-    )
 
-    # Patch for sparse models: strip truncate_dim, densify embeddings, and
-    # use encode_query/encode_document so the Router routes correctly for
-    # asymmetric models (e.g. gte v3 with separate query/document paths).
-    def embed_inputs_sparse(model, sentences, *, encode_fn_name=None, convert_to_tensor=True, **kwargs):
-        encode_fn = model.encode_query if encode_fn_name == "query" else model.encode_document
-        encode_chunk = 500
-        all_parts = []
-        for i in range(0, len(sentences), encode_chunk):
-            chunk = sentences[i:i + encode_chunk]
-            embs = encode_fn(chunk, batch_size=batch_size, show_progress_bar=True, convert_to_tensor=convert_to_tensor)
-            if hasattr(embs, 'is_sparse') and embs.is_sparse:
-                embs = embs.to_dense()
-            all_parts.append(embs.cpu())
-        return torch.cat(all_parts, dim=0)
+def setup_data_dir(eval_channel: Path, dataset_name: str) -> Path:
+    """Create directory layout expected by evaluate_model.load_eval_data.
 
-    evaluator.embed_inputs = embed_inputs_sparse
+    evaluate_model expects: data_dir/dataset_name/{corpus,queries,relevance}.jsonl
+    SageMaker provides:     /opt/ml/input/data/eval/{corpus,queries,relevance}.jsonl
 
-    results = evaluator(model)
-
-    sim_name = model.similarity_fn_name.value if hasattr(model.similarity_fn_name, "value") else str(model.similarity_fn_name)
-    ndcg = results.get(f"{dataset_name}-test_{sim_name}_ndcg@10", 0.0)
-    mrr = results.get(f"{dataset_name}-test_{sim_name}_mrr@10", 0.0)
-    recall = results.get(f"{dataset_name}-test_{sim_name}_recall@10", 0.0)
-
-    print(f"  NDCG@10: {ndcg:.4f}, MRR@10: {mrr:.4f}, Recall@10: {recall:.4f}")
-    return {"ndcg@10": ndcg, "mrr@10": mrr, "recall@10": recall, "num_queries": len(queries), "num_corpus": len(corpus)}
+    Create a symlink so evaluate_model can find the data.
+    """
+    data_dir = Path("/tmp/eval_data")
+    dataset_dir = data_dir / dataset_name
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    for fname in ("corpus.jsonl", "queries.jsonl", "relevance.jsonl"):
+        src = (eval_channel / fname).resolve()
+        dst = dataset_dir / fname
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        dst.symlink_to(src)
+    return data_dir
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_name", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--eval_baseline", type=str, default="false",
-                        help="Also evaluate baseline model (true/false, SageMaker passes as string)")
+    parser.add_argument("--eval_baseline", type=str, default="false")
     parser.add_argument("--baseline_model_name", type=str,
                         default="opensearch-project/opensearch-neural-sparse-encoding-v2-distill")
-    parser.add_argument("--model_dir", type=str, default=os.environ.get("SM_MODEL_DIR", "/opt/ml/model"))
-    parser.add_argument("--eval_dir", type=str, default=os.environ.get("SM_CHANNEL_EVAL", "/opt/ml/input/data/eval"))
-    parser.add_argument("--trained_model_dir", type=str, default=os.environ.get("SM_CHANNEL_MODEL", "/opt/ml/input/data/model"))
+    parser.add_argument("--model_dir", type=str,
+                        default=os.environ.get("SM_MODEL_DIR", "/opt/ml/model"))
+    parser.add_argument("--eval_dir", type=str,
+                        default=os.environ.get("SM_CHANNEL_EVAL", "/opt/ml/input/data/eval"))
+    parser.add_argument("--trained_model_dir", type=str,
+                        default=os.environ.get("SM_CHANNEL_MODEL", "/opt/ml/input/data/model"))
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    eval_dir = Path(args.eval_dir)
-    queries, corpus, qrels = load_eval_data(eval_dir)
+    # Set up data directory layout for evaluate_model
+    eval_channel = Path(args.eval_dir)
+    data_dir = setup_data_dir(eval_channel, args.dataset_name)
 
     all_results = {}
 
-    # Evaluate baseline (download from HuggingFace)
+    # Evaluate baseline
     if args.eval_baseline.lower() in ("true", "1", "yes"):
         print(f"\n=== Evaluating baseline: {args.baseline_model_name} ===")
-        baseline_model = SparseEncoder(args.baseline_model_name, trust_remote_code=True)
-        all_results["baseline"] = evaluate_model(
-            baseline_model, args.dataset_name, queries, corpus, qrels, args.batch_size
+        baseline_model = load_model(args.baseline_model_name, max_seq_length=4096, sparse=True)
+        result = evaluate_model(
+            baseline_model, args.dataset_name, data_dir, args.batch_size
         )
+        all_results["baseline"] = {
+            "ndcg@10": result.ndcg_at_10, "mrr@10": result.mrr_at_10,
+            "recall@10": result.recall_at_10,
+            "num_queries": result.num_queries, "num_corpus": result.num_corpus,
+        }
         del baseline_model
+        import torch
         torch.cuda.empty_cache()
 
-    # Evaluate trained model
-    # SageMaker may not auto-extract model.tar.gz — do it manually if needed.
-    import tarfile
-    model_path = Path(args.trained_model_dir)
-    tar_files = list(model_path.glob("*.tar.gz"))
-    if tar_files:
-        tar_file = tar_files[0]
-        print(f"Extracting {tar_file}...")
-        extract_dir = Path("/tmp/trained_model")
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(tar_file, "r:gz") as tar:
-            tar.extractall(extract_dir)
-        model_path = extract_dir
-    # Find model root: prefer config_sentence_transformers.json (SparseEncoder models),
-    # fall back to modules.json, then config.json (but only at top level to avoid
-    # picking up sub-module configs like SpladePooling/config.json).
-    st_configs = list(model_path.rglob("config_sentence_transformers.json"))
-    if st_configs:
-        model_path = st_configs[0].parent
-    elif list(model_path.rglob("modules.json")):
-        model_path = list(model_path.rglob("modules.json"))[0].parent
-    elif (model_path / "config.json").exists():
-        pass  # already at the right level
-    else:
-        config_files = list(model_path.rglob("config.json"))
-        if config_files:
-            model_path = config_files[0].parent
+    # Load and evaluate trained model
+    model_path = extract_if_tarball(Path(args.trained_model_dir))
+    model_path = find_model_root(model_path)
     print(f"\n=== Evaluating trained model: {model_path} ===")
-    print(f"  Contents: {[f.name for f in model_path.iterdir()]}")
-    trained_model = SparseEncoder(str(model_path), trust_remote_code=True)
-    all_results["trained"] = evaluate_model(
-        trained_model, args.dataset_name, queries, corpus, qrels, args.batch_size
-    )
+    print(f"  Contents: {sorted(f.name for f in model_path.iterdir())}")
 
-    # Save results to model output dir
+    trained_model = load_model(str(model_path), max_seq_length=4096, sparse=True)
+    result = evaluate_model(
+        trained_model, args.dataset_name, data_dir, args.batch_size
+    )
+    all_results["trained"] = {
+        "ndcg@10": result.ndcg_at_10, "mrr@10": result.mrr_at_10,
+        "recall@10": result.recall_at_10,
+        "num_queries": result.num_queries, "num_corpus": result.num_corpus,
+    }
+
+    # Save results
     output_path = Path(args.model_dir) / "results.json"
     with open(output_path, "w") as f:
         json.dump({"dataset": args.dataset_name, "results": all_results}, f, indent=2)
     print(f"\nResults saved to {output_path}")
 
-    # Print summary
     if "baseline" in all_results and "trained" in all_results:
         b = all_results["baseline"]["ndcg@10"]
         t = all_results["trained"]["ndcg@10"]
