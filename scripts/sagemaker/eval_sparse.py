@@ -65,21 +65,17 @@ def evaluate_model(model, dataset_name, queries, corpus, qrels, batch_size):
         corpus_chunk_size=10_000,
     )
 
-    # Patch for sparse models: strip truncate_dim, densify embeddings
-    def embed_inputs_sparse(model, sentences, *, encode_fn_name=None, is_query=False, convert_to_tensor=True, **kwargs):
-        use_query = encode_fn_name == "query" or is_query
-        encode_fn = model.encode_query if use_query else model.encode
+    # Patch for sparse models: strip truncate_dim, densify embeddings, and
+    # use encode_query/encode_document so the Router routes correctly for
+    # asymmetric models (e.g. gte v3 with separate query/document paths).
+    def embed_inputs_sparse(model, sentences, *, encode_fn_name=None, convert_to_tensor=True, **kwargs):
+        encode_fn = model.encode_query if encode_fn_name == "query" else model.encode_document
         encode_chunk = 500
-        if isinstance(sentences, dict):
-            embs = encode_fn(sentences, batch_size=batch_size, show_progress_bar=True, convert_to_tensor=convert_to_tensor)
-            if embs.is_sparse:
-                embs = embs.to_dense()
-            return embs.cpu()
         all_parts = []
         for i in range(0, len(sentences), encode_chunk):
             chunk = sentences[i:i + encode_chunk]
             embs = encode_fn(chunk, batch_size=batch_size, show_progress_bar=True, convert_to_tensor=convert_to_tensor)
-            if embs.is_sparse:
+            if hasattr(embs, 'is_sparse') and embs.is_sparse:
                 embs = embs.to_dense()
             all_parts.append(embs.cpu())
         return torch.cat(all_parts, dim=0)
@@ -133,8 +129,9 @@ def main():
     # SageMaker may not auto-extract model.tar.gz — do it manually if needed.
     import tarfile
     model_path = Path(args.trained_model_dir)
-    tar_file = model_path / "model.tar.gz"
-    if tar_file.exists():
+    tar_files = list(model_path.glob("*.tar.gz"))
+    if tar_files:
+        tar_file = tar_files[0]
         print(f"Extracting {tar_file}...")
         extract_dir = Path("/tmp/trained_model")
         extract_dir.mkdir(parents=True, exist_ok=True)
