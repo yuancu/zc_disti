@@ -25,6 +25,17 @@ from pathlib import Path
 from evaluate_model import evaluate_model, load_model
 
 
+def resolve_model_path(model_name_or_path: str) -> str:
+    """Pre-download a HuggingFace model and return the local snapshot path.
+
+    This ensures the model is available locally before loading, which avoids
+    issues with network timeouts during SparseEncoder initialization.
+    """
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(model_name_or_path)
+
+
 def find_model_root(model_path: Path) -> Path:
     """Find the SparseEncoder model root directory."""
     st_configs = list(model_path.rglob("config_sentence_transformers.json"))
@@ -83,6 +94,7 @@ def parse_args():
     parser.add_argument("--dataset_name", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--eval_baseline", type=str, default="false")
+    parser.add_argument("--baseline_only", type=str, default="false")
     parser.add_argument("--baseline_model_name", type=str,
                         default="opensearch-project/opensearch-neural-sparse-encoding-v2-distill")
     parser.add_argument("--model_dir", type=str,
@@ -106,7 +118,8 @@ def main():
     # Evaluate baseline
     if args.eval_baseline.lower() in ("true", "1", "yes"):
         print(f"\n=== Evaluating baseline: {args.baseline_model_name} ===")
-        baseline_model = load_model(args.baseline_model_name, max_seq_length=4096, sparse=True)
+        baseline_path = resolve_model_path(args.baseline_model_name)
+        baseline_model = load_model(baseline_path, max_seq_length=4096, sparse=True)
         result = evaluate_model(
             baseline_model, args.dataset_name, data_dir, args.batch_size
         )
@@ -119,21 +132,23 @@ def main():
         import torch
         torch.cuda.empty_cache()
 
-    # Load and evaluate trained model
-    model_path = extract_if_tarball(Path(args.trained_model_dir))
-    model_path = find_model_root(model_path)
-    print(f"\n=== Evaluating trained model: {model_path} ===")
-    print(f"  Contents: {sorted(f.name for f in model_path.iterdir())}")
+    # Load and evaluate trained model (skip if baseline_only)
+    baseline_only = args.baseline_only.lower() in ("true", "1", "yes")
+    if not baseline_only:
+        model_path = extract_if_tarball(Path(args.trained_model_dir))
+        model_path = find_model_root(model_path)
+        print(f"\n=== Evaluating trained model: {model_path} ===")
+        print(f"  Contents: {sorted(f.name for f in model_path.iterdir())}")
 
-    trained_model = load_model(str(model_path), max_seq_length=4096, sparse=True)
-    result = evaluate_model(
-        trained_model, args.dataset_name, data_dir, args.batch_size
-    )
-    all_results["trained"] = {
-        "ndcg@10": result.ndcg_at_10, "mrr@10": result.mrr_at_10,
-        "recall@10": result.recall_at_10,
-        "num_queries": result.num_queries, "num_corpus": result.num_corpus,
-    }
+        trained_model = load_model(str(model_path), max_seq_length=4096, sparse=True)
+        result = evaluate_model(
+            trained_model, args.dataset_name, data_dir, args.batch_size
+        )
+        all_results["trained"] = {
+            "ndcg@10": result.ndcg_at_10, "mrr@10": result.mrr_at_10,
+            "recall@10": result.recall_at_10,
+            "num_queries": result.num_queries, "num_corpus": result.num_corpus,
+        }
 
     # Save results
     output_path = Path(args.model_dir) / "results.json"

@@ -62,7 +62,7 @@ def load_eval_data(data_dir: Path, dataset_name: str) -> Tuple[Dict[str, str], D
             for line in f:
                 doc = json.loads(line.strip())
                 # Support both "_id" and "id" field names
-                doc_id = doc.get("_id") or doc.get("id")
+                doc_id = str(doc.get("_id") or doc.get("id"))
                 text = doc.get("text", "")
                 title = doc.get("title", "")
                 corpus[doc_id] = f"{title} {text}".strip() if title else text
@@ -77,7 +77,7 @@ def load_eval_data(data_dir: Path, dataset_name: str) -> Tuple[Dict[str, str], D
             for line in f:
                 query = json.loads(line.strip())
                 # Support both "_id" and "id" field names
-                query_id = query.get("_id") or query.get("id")
+                query_id = str(query.get("_id") or query.get("id"))
                 queries[query_id] = query["text"]
     else:
         raise FileNotFoundError(f"Queries file not found: {queries_path}")
